@@ -711,9 +711,10 @@ fn build_ext(vault_funded: bool) -> sp_io::TestExternalities {
         if vault_funded {
             VaultFunded::<Test>::put(true);
         }
-        // Spec §2.6 pool split: 5 protocol / 5 creator / 10 treasury / 10 pool.
+        // Spec §2.6 pool split at tier 3: 5 protocol / 5 creator / 10 treasury / 10 pool.
         frame_support::assert_ok!(VitreusDex::set_default_fee_routing(
             RuntimeOrigin::root(),
+            3,
             5,
             5,
             10

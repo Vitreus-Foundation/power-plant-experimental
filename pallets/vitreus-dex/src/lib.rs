@@ -97,9 +97,24 @@ pub const BPS: u32 = 10_000;
 pub const MIN_FEE_TIER: u32 = 1;
 
 /// Smallest tier the launchpad may seed a pool at (LAUNCH_TREASURY_SPEC §7.2
-/// tightened it from 1 to 3). A seeded pool carries every routed slice, so
-/// `DefaultFeeRouting.routed_bps() ≤ MIN_LAUNCH_FEE_TIER × 10`.
+/// tightened it from 1 to 3). A seeded pool carries every routed slice.
 pub const MIN_LAUNCH_FEE_TIER: u32 = 3;
+
+/// D10: bps of every swap a pool keeps for whoever provided its liquidity,
+/// whatever the routing says. Restores the floor §2.6 asked for and §10
+/// item 4 dropped: a launch pool is the only venue its token trades on, so
+/// routing the whole tier would leave anyone who adds liquidity after
+/// graduation earning nothing, and external depth would never arrive.
+pub const MIN_POOL_BPS: u16 = 10;
+
+/// D10: what a pool of `fee_tier` must keep — [`MIN_POOL_BPS`], or half the
+/// tier where the tier is too small to spare that much. Tier 1 (10 bps)
+/// keeps 5, which is what the protocol slice at tier 1 was always sized
+/// against; tiers 3 and 10 keep 10, leaving 20 and 90 bps routable.
+pub fn pool_floor_bps(fee_tier: u32) -> u16 {
+    let tier_bps = fee_tier.saturating_mul(10).min(u16::MAX as u32) as u16;
+    MIN_POOL_BPS.min(tier_bps / 2)
+}
 
 /// D4 / D9: how a pool's swap fee is split. Snapshotted into [`PoolInfo`] when
 /// the pool is created or seeded and never changed afterwards — the same
@@ -110,12 +125,11 @@ pub const MIN_LAUNCH_FEE_TIER: u32 = 3;
 /// from the input when VTRS is `asset_in`, from the output when it is
 /// `asset_out`. Pools with no native side route nothing.
 ///
-/// D9: the bound is tier-relative — a pool may route at most its whole
-/// tier (`routed ≤ fee_tier × 10`) — and is checked where the tier is
-/// known (create / seed). `set_default_fee_routing` checks the default
-/// against the smallest tier each kind of pool can have, so a default no
-/// pool could honour cannot be stored (that would fail every launchpad
-/// graduation at seed time, D4).
+/// D9: the bound is tier-relative and checked where the tier is known
+/// (create / seed). D10: it is also floored — a pool keeps at least
+/// [`pool_floor_bps`] — and the default is stored per tier, so a default
+/// that no pool of that tier could honour cannot be stored (that would
+/// fail every launchpad graduation at seed time, D4).
 #[derive(
     Clone, Copy, Encode, Decode, Default, Eq, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen,
 )]
@@ -136,16 +150,19 @@ impl FeeRouting {
             .saturating_add(self.creator_bps)
             .saturating_add(self.treasury_bps)
     }
-    /// D9: whether a pool of `fee_tier` can carry this split.
+    /// D10: whether a pool of `fee_tier` may be created with this split —
+    /// the routed slices plus the pool's floor must fit the tier. This is
+    /// the bound every creation path and the default setter check.
     pub fn is_valid_for(&self, fee_tier: u32) -> bool {
-        u32::from(self.routed_bps()) <= fee_tier.saturating_mul(10)
+        u32::from(self.routed_bps())
+            <= fee_tier.saturating_mul(10).saturating_sub(pool_floor_bps(fee_tier).into())
     }
-    /// D9: whether this split may be stored as the default: a plain pool at
-    /// the smallest tier carries the protocol slice alone; a seeded pool at
-    /// the smallest launch tier carries all three.
-    pub fn is_valid_default(&self) -> bool {
-        u32::from(self.protocol_bps) <= MIN_FEE_TIER.saturating_mul(10)
-            && self.is_valid_for(MIN_LAUNCH_FEE_TIER)
+    /// The arithmetic invariant alone: a pool cannot route more fee than it
+    /// charges. Weaker than [`is_valid_for`], which adds the pool's floor;
+    /// `try_state` checks this one, because a pool created under an earlier
+    /// bound keeps its snapshot and must not trip a later policy.
+    pub fn fits_tier(&self, fee_tier: u32) -> bool {
+        u32::from(self.routed_bps()) <= fee_tier.saturating_mul(10)
     }
 }
 
@@ -347,7 +364,7 @@ pub mod pallet {
     /// of every stored `PoolInfo`, so on the fork it is v3 with a migration
     /// (`migrations::v3`); the submission branch, which no chain with v1
     /// pools targets, carries D9 as its v2 without one.
-    const STORAGE_VERSION: StorageVersion = StorageVersion::new(3);
+    const STORAGE_VERSION: StorageVersion = StorageVersion::new(4);
 
     #[pallet::pallet]
     #[pallet::storage_version(STORAGE_VERSION)]
@@ -477,10 +494,18 @@ pub mod pallet {
     pub type TotalLiquidity<T: Config> =
         StorageMap<_, Blake2_128Concat, (T::AssetKind, T::AssetKind), T::Balance>;
 
-    /// D4: fee split applied to pools created or seeded from now on. Changing
-    /// it never touches an existing pool (each pool carries its own snapshot).
+    /// D4: fee split applied to pools created or seeded from now on, keyed
+    /// by fee tier (D10). Changing it never touches an existing pool (each
+    /// pool carries its own snapshot).
+    ///
+    /// Absent means *not configured for that tier*, which is not the same as
+    /// zero: a launchpad seed at an unconfigured tier is refused
+    /// ([`Error::NoDefaultFeeRouting`]) rather than graduating a pool that
+    /// silently routes nothing to its treasury. A `create_pool` pool at an
+    /// unconfigured tier routes nothing, as it did before any default was set.
     #[pallet::storage]
-    pub type DefaultFeeRouting<T: Config> = StorageValue<_, FeeRouting, ValueQuery>;
+    pub type DefaultFeeRouting<T: Config> =
+        StorageMap<_, Twox64Concat, u32, FeeRouting, OptionQuery>;
 
     /// D4: where protocol fees are paid on `withdraw_protocol_fees`. `None`
     /// means `T::DefaultProtocolFeeRecipient` (the runtime Treasury).
@@ -679,7 +704,9 @@ pub mod pallet {
         },
         /// D4: governance changed the split for pools created from now on.
         DefaultFeeRoutingSet {
-            /// The new default.
+            /// D10: the fee tier this default applies to.
+            fee_tier: u32,
+            /// The new default for that tier.
             routing: FeeRouting,
         },
         /// D4: governance changed where protocol fees are paid.
@@ -881,8 +908,14 @@ pub mod pallet {
         /// `ExcessRecipient` (for example, the recipient has no provider and the
         /// asset is not sufficient). Fix the recipient and retry the seed.
         ExcessRecipientCannotReceive,
-        /// D4 / D9: the split is more than the pool's tier can carry.
+        /// D4 / D9 / D10: the split is more than the pool's tier can carry
+        /// once the pool's own floor is kept.
         InvalidFeeRouting,
+        /// D10: no default routing is configured for this tier, so a
+        /// launchpad seed cannot snapshot one. Governance must set the tier
+        /// before a launch at it can graduate (FM-11: a deferred graduation,
+        /// retried by `graduate` once the default exists).
+        NoDefaultFeeRouting,
         /// D4: no creator is known for this asset, so it has no creator share.
         NoCreatorForAsset,
         /// D4: the caller is not the asset's creator fee recipient.
@@ -1696,21 +1729,31 @@ pub mod pallet {
 
         /// D4: set the fee split for pools created or seeded from now on.
         /// Gated on `ManageOrigin`. Never changes an existing pool's split.
-        /// D9: must be a split every kind of pool can carry
-        /// ([`FeeRouting::is_valid_default`]).
+        /// D10: per tier, and checked against *that* tier
+        /// ([`FeeRouting::is_valid_for`]), so a 1 % pool may route what a
+        /// 0.3 % pool cannot. Tiers below [`MIN_LAUNCH_FEE_TIER`] can carry
+        /// no creator or treasury slice: the launchpad cannot seed them, so
+        /// no pool at that tier has either party.
         #[pallet::call_index(16)]
         #[pallet::weight(<T as Config>::WeightInfo::set_default_fee_routing())]
         pub fn set_default_fee_routing(
             origin: OriginFor<T>,
+            fee_tier: u32,
             protocol_bps: u16,
             creator_bps: u16,
             treasury_bps: u16,
         ) -> DispatchResult {
             T::ManageOrigin::ensure_origin(origin)?;
+            Self::ensure_valid_fee_tier(fee_tier)?;
             let routing = FeeRouting { protocol_bps, creator_bps, treasury_bps };
-            ensure!(routing.is_valid_default(), Error::<T>::InvalidFeeRouting);
-            DefaultFeeRouting::<T>::put(routing);
-            Self::deposit_event(Event::DefaultFeeRoutingSet { routing });
+            ensure!(routing.is_valid_for(fee_tier), Error::<T>::InvalidFeeRouting);
+            ensure!(
+                fee_tier >= MIN_LAUNCH_FEE_TIER
+                    || (routing.creator_bps == 0 && routing.treasury_bps == 0),
+                Error::<T>::InvalidFeeRouting
+            );
+            DefaultFeeRouting::<T>::insert(fee_tier, routing);
+            Self::deposit_event(Event::DefaultFeeRoutingSet { fee_tier, routing });
             Ok(())
         }
 
@@ -1806,16 +1849,29 @@ pub mod pallet {
         /// zero; `seeded = false` (plain `create_pool`) folds the creator
         /// and treasury slices into the pool since nobody could claim them
         /// (D9: a treasury exists only for a launch asset).
-        fn routing_for_new_pool(pair: &(T::AssetKind, T::AssetKind), seeded: bool) -> FeeRouting {
+        /// D10: the split a new pool of `fee_tier` snapshots. A pool with no
+        /// native side routes nothing. A seeded pool takes the tier's default
+        /// whole and **fails** if that tier has none — governance setting one
+        /// tier and forgetting another must not graduate a launch whose
+        /// treasury would then be fed nothing, for the life of the pool. A
+        /// `create_pool` pool takes the protocol slice alone, and nothing at
+        /// all where the tier is unconfigured.
+        fn routing_for_new_pool(
+            pair: &(T::AssetKind, T::AssetKind),
+            fee_tier: u32,
+            seeded: bool,
+        ) -> Result<FeeRouting, Error<T>> {
             let native = T::NativeAsset::get().encode();
             if pair.0.encode() != native && pair.1.encode() != native {
-                return FeeRouting::default();
+                return Ok(FeeRouting::default());
             }
-            let d = DefaultFeeRouting::<T>::get();
-            if seeded {
-                d
-            } else {
-                FeeRouting { protocol_bps: d.protocol_bps, creator_bps: 0, treasury_bps: 0 }
+            match (DefaultFeeRouting::<T>::get(fee_tier), seeded) {
+                (Some(d), true) => Ok(d),
+                (Some(d), false) => {
+                    Ok(FeeRouting { protocol_bps: d.protocol_bps, creator_bps: 0, treasury_bps: 0 })
+                },
+                (None, true) => Err(Error::<T>::NoDefaultFeeRouting),
+                (None, false) => Ok(FeeRouting::default()),
             }
         }
 
@@ -1936,7 +1992,7 @@ pub mod pallet {
             ensure!(!Pools::<T>::contains_key(&pair), Error::<T>::PoolAlreadyExists);
 
             // D4: no creator can exist for a governance-created pool.
-            let routing = Self::routing_for_new_pool(&pair, false);
+            let routing = Self::routing_for_new_pool(&pair, fee_tier, false)?;
             Self::insert_new_pool(&pair, fee_tier, routing)?;
             Ok(())
         }
@@ -2029,9 +2085,11 @@ pub mod pallet {
                 // D4: a seeded pool has a creator (the launch's fee recipient),
                 // so it snapshots the full default split. An adopted empty
                 // record keeps whatever split it carries.
-                None => {
-                    Self::insert_new_pool(&pair, fee_tier, Self::routing_for_new_pool(&pair, true))?
-                },
+                None => Self::insert_new_pool(
+                    &pair,
+                    fee_tier,
+                    Self::routing_for_new_pool(&pair, fee_tier, true)?,
+                )?,
                 Some(existing) => {
                     let shares = TotalLiquidity::<T>::get(&pair).unwrap_or_else(Zero::zero);
                     ensure!(shares.is_zero(), Error::<T>::PoolAlreadySeeded);
@@ -2713,6 +2771,7 @@ pub mod migrations {
     use super::*;
     use frame_support::{
         migrations::VersionedMigration,
+        pallet_prelude::OptionQuery,
         traits::{Get, UncheckedOnRuntimeUpgrade},
         weights::Weight,
     };
@@ -2956,6 +3015,7 @@ pub mod migrations {
     /// governance's to set with `set_default_fee_routing`. `LastSwapBlock` is
     /// a new map and needs nothing. Fork-only: the submission's D9 is its v2
     /// and no chain it targets has a pre-D9 pool.
+    #[allow(missing_docs)]
     pub mod v3 {
         use super::*;
 
@@ -2978,6 +3038,12 @@ pub mod migrations {
             pub pool_account: AccountId,
             pub routing: OldFeeRouting,
         }
+
+        /// `DefaultFeeRouting` as it was before D10 made it per tier: one
+        /// value under the pallet's own prefix. v3 predates the map, so it
+        /// addresses the key it actually migrated.
+        #[frame_support::storage_alias]
+        pub type DefaultFeeRouting<T: Config> = StorageValue<Pallet<T>, FeeRouting, OptionQuery>;
 
         fn widen(old: OldFeeRouting) -> FeeRouting {
             FeeRouting {
@@ -3004,7 +3070,7 @@ pub mod migrations {
                         routing: widen(old.routing),
                     })
                 });
-                // Absent stays absent: `get()` answers zero routing either way.
+                // Absent stays absent: a pool with no default routes nothing.
                 let default_set = DefaultFeeRouting::<T>::exists();
                 let _ = DefaultFeeRouting::<T>::translate::<OldFeeRouting, _>(|old| old.map(widen));
                 log::info!(
@@ -3038,17 +3104,20 @@ pub mod migrations {
                         "every pre-D9 pool carries treasury_bps = 0"
                     );
                     frame_support::ensure!(
-                        pool.routing.is_valid_for(pool.fee_tier),
+                        pool.routing.fits_tier(pool.fee_tier),
                         "routing still fits the tier"
                     );
                 }
                 frame_support::ensure!(n == pools, "every pool decodes after D9");
-                let d = DefaultFeeRouting::<T>::get();
                 frame_support::ensure!(
-                    d.treasury_bps == 0,
+                    DefaultFeeRouting::<T>::get().map_or(true, |d| d.treasury_bps == 0),
                     "default routing carries treasury_bps = 0 until governance sets it"
                 );
-                log::info!(target: "runtime::vitreus-dex", "D9 post_upgrade: {n} pools decode with treasury_bps = 0; default routing protocol {} / creator {} / treasury 0", d.protocol_bps, d.creator_bps);
+                log::info!(
+                    target: "runtime::vitreus-dex",
+                    "D9 post_upgrade: {n} pools decode with treasury_bps = 0; default routing {:?}",
+                    DefaultFeeRouting::<T>::get()
+                );
                 Ok(())
             }
         }
@@ -3058,6 +3127,118 @@ pub mod migrations {
             2,
             3,
             VersionUncheckedMigrateToV3<T>,
+            Pallet<T>,
+            <T as frame_system::Config>::DbWeight,
+        >;
+    }
+
+    /// D10 (v3 → v4): `DefaultFeeRouting` becomes one entry per fee tier, so
+    /// a 1 % pool can route what a 0.3 % pool cannot.
+    ///
+    /// The single pre-D10 value was validated against tier 3, so that is the
+    /// tier it becomes — and only if it still fits under D10's floor
+    /// (`routed ≤ 20` at tier 3). A value that does not fit is dropped with a
+    /// warning rather than clamped: a split nobody chose is worse than none,
+    /// and none is visible — a launch at that tier stops at
+    /// [`Error::NoDefaultFeeRouting`] until governance sets it.
+    ///
+    /// Tiers 1 and 10 are left unset deliberately. Existing pools are not
+    /// touched at all: routing is snapshotted at creation and immutable, so
+    /// every pool keeps the split it was created with.
+    #[allow(missing_docs)]
+    pub mod v4 {
+        use super::*;
+
+        /// The pre-D10 single value; the same key v3 wrote.
+        #[allow(missing_docs)]
+        #[frame_support::storage_alias]
+        pub type DefaultFeeRouting<T: Config> = StorageValue<Pallet<T>, FeeRouting, OptionQuery>;
+
+        /// Unversioned body; wrap in [`MigrateToV4`].
+        pub struct VersionUncheckedMigrateToV4<T>(PhantomData<T>);
+
+        impl<T: Config> UncheckedOnRuntimeUpgrade for VersionUncheckedMigrateToV4<T> {
+            fn on_runtime_upgrade() -> Weight {
+                let old = DefaultFeeRouting::<T>::take();
+                match old {
+                    Some(routing) if routing.is_valid_for(MIN_LAUNCH_FEE_TIER) => {
+                        super::super::DefaultFeeRouting::<T>::insert(MIN_LAUNCH_FEE_TIER, routing);
+                        log::info!(
+                            target: "runtime::vitreus-dex",
+                            "D10 migration: default routing {routing:?} moved to tier {MIN_LAUNCH_FEE_TIER}; tiers 1 and 10 unset"
+                        );
+                    },
+                    Some(routing) => {
+                        log::warn!(
+                            target: "runtime::vitreus-dex",
+                            "D10 migration: default routing {routing:?} routes more than tier {MIN_LAUNCH_FEE_TIER} may under the pool floor; dropped, governance must set it"
+                        );
+                    },
+                    None => {
+                        log::info!(
+                            target: "runtime::vitreus-dex",
+                            "D10 migration: no default routing was set; every tier starts unset"
+                        );
+                    },
+                }
+                T::DbWeight::get().reads_writes(1, 2)
+            }
+
+            #[cfg(feature = "try-runtime")]
+            fn pre_upgrade() -> Result<sp_std::vec::Vec<u8>, sp_runtime::TryRuntimeError> {
+                let old = DefaultFeeRouting::<T>::get();
+                let pools = Pools::<T>::iter().count() as u32;
+                log::info!(
+                    target: "runtime::vitreus-dex",
+                    "D10 pre_upgrade: default routing {old:?}; {pools} pools, none of which is touched"
+                );
+                Ok((old, pools).encode())
+            }
+
+            #[cfg(feature = "try-runtime")]
+            fn post_upgrade(
+                state: sp_std::vec::Vec<u8>,
+            ) -> Result<(), sp_runtime::TryRuntimeError> {
+                let (old, pools): (Option<FeeRouting>, u32) =
+                    Decode::decode(&mut &state[..]).map_err(|_| "pre_upgrade state")?;
+                frame_support::ensure!(
+                    !DefaultFeeRouting::<T>::exists(),
+                    "the pre-D10 single value is gone"
+                );
+                let at_three = super::super::DefaultFeeRouting::<T>::get(MIN_LAUNCH_FEE_TIER);
+                match old {
+                    Some(r) if r.is_valid_for(MIN_LAUNCH_FEE_TIER) => frame_support::ensure!(
+                        at_three == Some(r),
+                        "a default that fits tier 3 is now tier 3's default"
+                    ),
+                    _ => frame_support::ensure!(
+                        at_three.is_none(),
+                        "no default that did not fit was invented"
+                    ),
+                }
+                frame_support::ensure!(
+                    super::super::DefaultFeeRouting::<T>::get(MIN_FEE_TIER).is_none()
+                        && super::super::DefaultFeeRouting::<T>::get(10).is_none(),
+                    "tiers 1 and 10 are left for governance"
+                );
+                let mut n = 0u32;
+                for (_pair, pool) in Pools::<T>::iter() {
+                    n = n.saturating_add(1);
+                    frame_support::ensure!(
+                        pool.routing.fits_tier(pool.fee_tier),
+                        "every pool still routes no more than its tier"
+                    );
+                }
+                frame_support::ensure!(n == pools, "no pool was added or lost");
+                Ok(())
+            }
+        }
+
+        /// D10 migration, gated on the pallet's on-chain storage version.
+        pub type MigrateToV4<T> = VersionedMigration<
+            3,
+            4,
+            VersionUncheckedMigrateToV4<T>,
             Pallet<T>,
             <T as frame_system::Config>::DbWeight,
         >;

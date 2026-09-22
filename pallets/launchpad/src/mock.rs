@@ -379,6 +379,19 @@ pub fn new_test_ext() -> sp_io::TestExternalities {
         HOOK_REJECT_CREATION_BLOCK.with(|r| *r.borrow_mut() = false);
         SINK_VAULT.with(|v| *v.borrow_mut() = None);
         SINK_NOTED.with(|n| n.borrow_mut().clear());
+        // D10: the DEX's fee routing is per tier and a seed at an
+        // unconfigured tier is refused, so a chain configures the tiers its
+        // launches can graduate at. Zero here — these tests are about the
+        // pad, and the ones about routing set their own.
+        for tier in [3, 10] {
+            frame_support::assert_ok!(VitreusDex::set_default_fee_routing(
+                RuntimeOrigin::root(),
+                tier,
+                0,
+                0,
+                0
+            ));
+        }
     });
     ext
 }

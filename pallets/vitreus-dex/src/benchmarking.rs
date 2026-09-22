@@ -442,12 +442,14 @@ mod benchmarks {
     fn set_default_fee_routing() -> Result<(), BenchmarkError> {
         let origin = manage_origin::<T>()?;
 
+        // D10: the default is per tier; tier 3 is the smallest a launch pool
+        // can be, and the write is one map entry whatever the tier.
         #[extrinsic_call]
-        _(origin as T::RuntimeOrigin, 5, 5, 0);
+        _(origin as T::RuntimeOrigin, 3u32, 5, 5, 0);
 
         assert_eq!(
-            DefaultFeeRouting::<T>::get(),
-            FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 0 }
+            DefaultFeeRouting::<T>::get(3),
+            Some(FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 0 })
         );
         Ok(())
     }

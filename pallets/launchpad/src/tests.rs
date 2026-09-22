@@ -1639,7 +1639,7 @@ fn d4_graduated_pool_routes_fees_and_the_launch_recipient_claims_them() {
     use pallet_vitreus_dex::{CreatorFeesUnclaimed, FeeRouting, ProtocolFeesUnclaimed};
 
     new_test_ext().execute_with(|| {
-        assert_ok!(VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 5, 5, 0));
+        assert_ok!(VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 3, 5, 5, 0));
         let id = create(ALICE);
         cross(BOB, id);
         assert_eq!(state(id).phase, Phase::Graduated);
