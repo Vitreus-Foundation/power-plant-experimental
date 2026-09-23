@@ -49,9 +49,11 @@ use frame_support::{
     traits::{
         fungibles::{Inspect as FungiblesInspect, Mutate as FungiblesMutate},
         tokens::{
+            DepositConsequence,
             Fortitude::{Force, Polite},
             Precision::Exact,
             Preservation::{Expendable, Preserve},
+            Provenance,
         },
         EnsureOrigin, Get,
     },
@@ -668,6 +670,35 @@ pub mod pallet {
 
         // ---- §6.4 compound ---------------------------------------------
 
+        /// Whether paying `amount` to `who` would actually land.
+        ///
+        /// The old test was `amount >= ed`, which is not the question the
+        /// transfer asks. `fungibles::Mutate::transfer` routes through
+        /// `UnionOf`'s Left arm to `pallet_balances`, whose `can_deposit`
+        /// compares `free + amount` against the existential deposit, never
+        /// `amount` on its own: an account already at or above ED takes any
+        /// positive amount. A keeper necessarily exists — it just paid for
+        /// the extrinsic — so the old test refused a payment the transfer
+        /// would have accepted, on every compound the dev chain ever ran.
+        /// Asking `can_deposit` here means the predicate and the transfer
+        /// cannot disagree: `UnionOf` routes both through the same arms.
+        ///
+        /// The vault is excluded because `fungible`'s default `transfer`
+        /// returns `Ok(amount)` for `source == dest` without moving
+        /// anything, so a vault paying itself would count as paid and be
+        /// deducted from `pending_burn` while never leaving the vault.
+        fn bounty_lands(vault: &T::AccountId, who: &T::AccountId, amount: BalanceOf<T>) -> bool {
+            if who == vault || amount.is_zero() {
+                return false;
+            }
+            <<T as pallet_vitreus_dex::Config>::Assets as FungiblesInspect<T::AccountId>>::can_deposit(
+                Self::native(),
+                who,
+                amount,
+                Provenance::Extant,
+            ) == DepositConsequence::Success
+        }
+
         /// Largest `x ≤ want` whose VTRS quote the broker can pay.
         fn sellable(want: BalanceOf<T>) -> Option<(BalanceOf<T>, BalanceOf<T>)> {
             let lnrg = T::LnrgAsset::get();
@@ -733,10 +764,7 @@ pub mod pallet {
                     (terms.keeper_bounty_bps as u128).into(),
                     (BPS as u128).into(),
                 )?;
-                let ed = <<T as pallet_vitreus_dex::Config>::Assets as FungiblesInspect<
-                    T::AccountId,
-                >>::minimum_balance(Self::native());
-                if bounty >= ed {
+                if Self::bounty_lands(&vault, caller, bounty) {
                     <<T as pallet_vitreus_dex::Config>::Assets as FungiblesMutate<T::AccountId>>::transfer(
                         Self::native(),
                         &vault,
@@ -780,19 +808,18 @@ pub mod pallet {
                     tokens_burned = tokens;
                     did_something = true;
                     // The slice pays its caller as the sale does — the same
-                    // rate on what was burned, from `pending_burn`, above
-                    // ED or not at all. A retired launch's principal goes
-                    // out over many slices with nothing to sell, and the
-                    // keeper that runs them is paid for each (§6.4).
+                    // rate on what was burned, from `pending_burn`, whenever
+                    // the deposit can land. A retired launch's principal
+                    // goes out over many slices with nothing to sell, and
+                    // the keeper that runs them is paid for each (§6.4).
                     let slice_bounty = Self::mul_div(
                         spent,
                         (terms.keeper_bounty_bps as u128).into(),
                         (BPS as u128).into(),
                     )?;
-                    let ed = <<T as pallet_vitreus_dex::Config>::Assets as FungiblesInspect<
-                        T::AccountId,
-                    >>::minimum_balance(Self::native());
-                    if slice_bounty >= ed && slice_bounty <= t.pending_burn {
+                    if slice_bounty <= t.pending_burn
+                        && Self::bounty_lands(&vault, caller, slice_bounty)
+                    {
                         <<T as pallet_vitreus_dex::Config>::Assets as FungiblesMutate<
                             T::AccountId,
                         >>::transfer(
