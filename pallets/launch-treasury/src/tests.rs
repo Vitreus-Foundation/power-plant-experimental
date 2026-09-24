@@ -388,6 +388,183 @@ fn t_l9_burn_slice_pays_the_keeper() {
     });
 }
 
+/// An account with no balance at all: a deposit that would leave it below
+/// the existential deposit is the one case `can_deposit` actually refuses.
+const POOR: Acc = acc(0x55);
+
+/// §6.4: the bounty is paid whenever the deposit can land, which is not the
+/// same as the bounty being above the existential deposit.
+///
+/// `fungibles::Mutate::transfer` routes through `UnionOf`'s Left arm to
+/// `pallet_balances`, whose `can_deposit` compares `free + amount` against
+/// ED and never `amount` alone. A keeper necessarily exists — it just paid
+/// for the extrinsic — so the old `bounty >= ed` test refused work that had
+/// already been done. The compound here happens before the burn interval
+/// has passed, so no slice runs and the bounty is the sale's alone.
+#[test]
+fn t_l10_sub_ed_bounty_is_paid_to_a_funded_keeper() {
+    new_test_ext().execute_with(|| {
+        let a = graduated_with_volume(ALICE, 10);
+        assert_ok!(stake(a));
+        // Small enough that 50 bps of the proceeds lands under ED.
+        pay_rewards(ED / 10);
+        let keeper_before = vtrs(KEEPER);
+        let burn_before = treasury(a).pending_burn;
+
+        assert_ok!(compound(a));
+        let Event::Compounded { vtrs_realised, bounty, vtrs_burned_in, .. } = last_event() else {
+            panic!("Compounded, got {:?}", last_event())
+        };
+        assert_eq!(
+            vtrs_burned_in, 0,
+            "the interval has not passed: this is the sale's bounty alone"
+        );
+        assert!(
+            bounty > 0 && bounty < ED,
+            "a bounty `bounty >= ed` refused: {bounty} against ED {ED}"
+        );
+        assert_eq!(bounty, vtrs_realised * BOUNTY_BPS as u128 / BPS as u128);
+        assert_eq!(vtrs(KEEPER), keeper_before + bounty, "the keeper was paid");
+        assert_eq!(
+            treasury(a).pending_burn,
+            burn_before + vtrs_realised - bounty,
+            "the rest went to the buyback, as it always did"
+        );
+        ok_state();
+    });
+}
+
+/// §6.4: and it is refused where the deposit genuinely cannot land — an
+/// account with nothing, which the deposit would leave under ED. The amount
+/// stays in `pending_burn`, exactly as before this change. The second half
+/// shows what the refusal is actually about: the same empty account takes a
+/// bounty that is itself above ED, because then `free + amount >= ED`.
+#[test]
+fn t_l11_sub_ed_bounty_is_refused_to_an_empty_account() {
+    new_test_ext().execute_with(|| {
+        let a = graduated_with_volume(ALICE, 10);
+        assert_ok!(stake(a));
+        pay_rewards(ED / 10);
+        let burn_before = treasury(a).pending_burn;
+        assert_eq!(vtrs(POOR), 0, "POOR holds nothing");
+
+        assert_ok!(LaunchTreasury::compound(origin(POOR), a));
+        let Event::Compounded { vtrs_realised, bounty, .. } = last_event() else {
+            panic!("Compounded, got {:?}", last_event())
+        };
+        assert!(vtrs_realised > 0);
+        assert_eq!(bounty, 0, "the deposit would leave POOR below ED");
+        assert_eq!(vtrs(POOR), 0);
+        assert_eq!(
+            treasury(a).pending_burn,
+            burn_before + vtrs_realised,
+            "the whole sale went to the buyback"
+        );
+        ok_state();
+
+        // Above ED the same empty account is paid: the refusal is about the
+        // resulting balance, not about who the caller is.
+        pay_rewards(1_000 * ED);
+        run_to(now() + BURN_INTERVAL);
+        assert_ok!(LaunchTreasury::compound(origin(POOR), a));
+        let Event::Compounded { bounty, .. } = last_event() else { panic!("Compounded") };
+        assert!(bounty >= ED, "{bounty} is at or above ED");
+        assert_eq!(vtrs(POOR), bounty, "the empty account now exists, holding its bounty");
+        ok_state();
+    });
+}
+
+/// §6.4: the vault is never paid its own bounty. `fungible`'s default
+/// `transfer` short-circuits `source == dest` with `Ok(amount)` without
+/// moving anything, so a vault compounding for itself would count the
+/// bounty as paid and deduct it from `pending_burn` while the VTRS never
+/// left — `held` unchanged, `pending_burn` short by the bounty, which is
+/// exactly the I-T1 inequality at `do_try_state`. `ok_state()` is the
+/// assertion that matters here.
+#[test]
+fn t_l12_the_vault_is_never_paid_its_own_bounty() {
+    new_test_ext().execute_with(|| {
+        let a = graduated_with_volume(ALICE, 10);
+        assert_ok!(stake(a));
+        pay_rewards(50 * UNIT); // far above ED: only the vault guard can refuse this
+        let vault_before = vtrs(vault());
+        let burn_before = treasury(a).pending_burn;
+
+        assert_ok!(LaunchTreasury::compound(RuntimeOrigin::signed(vault()), a));
+        let Event::Compounded { vtrs_realised, bounty, vtrs_burned_in, .. } = last_event() else {
+            panic!("Compounded, got {:?}", last_event())
+        };
+        assert!(vtrs_realised > ED * 1_000, "a bounty the ED test would have paid");
+        assert_eq!(vtrs_burned_in, 0, "no slice this block");
+        assert_eq!(bounty, 0, "the vault does not pay itself");
+        assert_eq!(vtrs(vault()), vault_before + vtrs_realised, "every unit of it stayed");
+        assert_eq!(treasury(a).pending_burn, burn_before + vtrs_realised);
+        ok_state();
+    });
+}
+
+/// §6.4: the same predicate at the slice site. The mock's bounds make a
+/// sub-ED slice bounty reachable only on a small venue at a low rate —
+/// `max_burn_impact_bps` floors at 10 and `MinGraduationTarget` is 3 VTRS,
+/// so at the default 50 bps the smallest slice a cap can produce still pays
+/// several times ED. The rate is a governance term; the point under test is
+/// the predicate, not the rate.
+#[test]
+fn t_l13_slice_bounty_below_ed_is_paid() {
+    new_test_ext().execute_with(|| {
+        // A thin venue: the cap, and so the slice, is small.
+        let mut p = pallet_launchpad::Params::<Test>::get();
+        p.graduation_target = 3 * UNIT;
+        assert_ok!(Launchpad::set_params(RuntimeOrigin::root(), p));
+        let a = create(ALICE);
+        cross(BOB, a);
+        let mut terms = Terms::<Test>::get();
+        terms.max_burn_impact_bps = 10;
+        terms.keeper_bounty_bps = 5;
+        assert_ok!(LaunchTreasury::set_terms(RuntimeOrigin::root(), terms));
+
+        // Never staked, so retirement alone puts the fees into `pending_burn`.
+        run_to(now() + DORMANCY);
+        assert_ok!(retire(a));
+        let principal = treasury(a).pending_burn;
+        assert!(principal > 0, "the crossing fee funded it");
+
+        run_to(now() + BURN_INTERVAL);
+        let keeper_before = vtrs(KEEPER);
+        assert_ok!(compound(a));
+        let Event::Compounded { lnrg_sold, vtrs_realised, bounty, vtrs_burned_in, .. } =
+            last_event()
+        else {
+            panic!("Compounded, got {:?}", last_event())
+        };
+        assert_eq!(
+            (lnrg_sold, vtrs_realised),
+            (0, 0),
+            "nothing to sell: this is the slice's bounty"
+        );
+        assert!(vtrs_burned_in > 0 && vtrs_burned_in < principal, "one slice of several");
+        assert_eq!(bounty, vtrs_burned_in * 5 / BPS as u128);
+        assert!(
+            bounty > 0 && bounty < ED,
+            "a slice bounty `slice_bounty >= ed` refused: {bounty} against ED {ED}"
+        );
+        assert_eq!(vtrs(KEEPER), keeper_before + bounty);
+        assert_eq!(treasury(a).pending_burn, principal - vtrs_burned_in - bounty);
+        ok_state();
+
+        // The vault guard holds at this site too.
+        run_to(now() + BURN_INTERVAL);
+        let before = treasury(a).pending_burn;
+        assert_ok!(LaunchTreasury::compound(RuntimeOrigin::signed(vault()), a));
+        let Event::Compounded { bounty, vtrs_burned_in, .. } = last_event() else {
+            panic!("Compounded")
+        };
+        assert_eq!(bounty, 0, "the vault does not pay itself at the slice either");
+        assert_eq!(treasury(a).pending_burn, before - vtrs_burned_in);
+        ok_state();
+    });
+}
+
 #[test]
 fn t_l4_retire_requires_dormancy_and_is_one_way() {
     new_test_ext().execute_with(|| {
