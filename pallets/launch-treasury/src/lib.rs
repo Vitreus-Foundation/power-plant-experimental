@@ -497,7 +497,7 @@ pub mod pallet {
             <T as Config>::PalletId::get().into_account_truncating()
         }
 
-        fn native() -> AssetKindOf<T> {
+        pub(crate) fn native() -> AssetKindOf<T> {
             <T as pallet_launchpad::Config>::NativeAssetKind::get()
         }
 
@@ -1203,14 +1203,83 @@ pub mod pallet {
     }
 }
 
-/// Fork-only migrations (LAUNCH_TREASURY_SPEC §10.12): what a running chain
-/// needs and the submission must not carry.
+/// Runtime upgrades (LAUNCH_TREASURY_SPEC §10.12): they live in the pallet
+/// and run wherever the chain's state calls for them.
 pub mod migrations {
     use super::*;
     use frame_support::{
-        migrations::VersionedMigration, traits::UncheckedOnRuntimeUpgrade, weights::Weight,
+        migrations::VersionedMigration,
+        traits::{OnRuntimeUpgrade, UncheckedOnRuntimeUpgrade},
+        weights::Weight,
     };
     use sp_std::marker::PhantomData;
+
+    /// Funds the vault with its existential deposit once, from `Source`, so
+    /// `OnNewAccount` starts its reputation record at the upgrade block
+    /// (spec §2.2, §7.4) rather than at the first fee.
+    ///
+    /// `Source` pays with `Preserve`, so it needs more than twice the ED. If
+    /// it cannot pay, the upgrade goes on with `VaultFunded` clear and the
+    /// first fee withholds the ED instead (§9.6).
+    ///
+    /// Not versioned: it changes no layout (`VaultFunded` reads `false` when
+    /// absent). What makes a second run harmless is the guard, not a version.
+    pub struct FundVault<T, Source>(PhantomData<(T, Source)>);
+
+    impl<T: Config, Source: Get<T::AccountId>> OnRuntimeUpgrade for FundVault<T, Source> {
+        fn on_runtime_upgrade() -> Weight {
+            let ed = <<T as pallet_vitreus_dex::Config>::Assets as FungiblesInspect<
+                T::AccountId,
+            >>::minimum_balance(Pallet::<T>::native());
+            let vault = Pallet::<T>::vault();
+
+            // The measure I-T1 counts the buffer with. An account alive on a
+            // provider ref can hold less than its ED, and then the buffer §4
+            // assumes is not there.
+            if Pallet::<T>::assets_balance(Pallet::<T>::native(), &vault) >= ed {
+                log::info!(target: "runtime::launch-treasury", "FundVault: the vault already holds its ED");
+                VaultFunded::<T>::put(true);
+                return T::DbWeight::get().reads_writes(1, 1);
+            }
+
+            let res = <<T as pallet_vitreus_dex::Config>::Assets as FungiblesMutate<
+                T::AccountId,
+            >>::transfer(
+                Pallet::<T>::native(), &Source::get(), &vault, ed, Preserve
+            );
+            // A source that cannot pay must not brick the upgrade: §9.6 has
+            // the first fee withhold the ED instead. `post_upgrade` is where
+            // that failure is meant to be loud.
+            match res {
+                Ok(_) => {
+                    log::info!(target: "runtime::launch-treasury", "FundVault: paid the vault's ED from {:?}", Source::get());
+                    VaultFunded::<T>::put(true);
+                },
+                Err(e) => {
+                    log::error!(target: "runtime::launch-treasury", "FundVault: {:?} could not pay the vault's ED ({e:?}); the first fee will withhold it instead", Source::get());
+                },
+            }
+
+            T::DbWeight::get().reads_writes(3, 4)
+        }
+
+        /// The vault holds its ED and the pallet knows it. Not a restatement
+        /// of I-T1: `try_state` covers the balance, but only under
+        /// `--checks=all`, and I-T1 is *weaker* while `VaultFunded` is false
+        /// — so a transfer that failed into the log would pass it unnoticed.
+        #[cfg(feature = "try-runtime")]
+        fn post_upgrade(_state: Vec<u8>) -> Result<(), sp_runtime::TryRuntimeError> {
+            let ed = <<T as pallet_vitreus_dex::Config>::Assets as FungiblesInspect<
+                T::AccountId,
+            >>::minimum_balance(Pallet::<T>::native());
+            let held = Pallet::<T>::assets_balance(Pallet::<T>::native(), &Pallet::<T>::vault());
+
+            frame_support::ensure!(VaultFunded::<T>::get(), "FundVault: VaultFunded not set");
+            frame_support::ensure!(held >= ed, "FundVault: vault below ED");
+            log::info!(target: "runtime::launch-treasury", "FundVault post_upgrade: vault holds {:?}, ED {:?}", held, ed);
+            Ok(())
+        }
+    }
 
     /// v0 → v1 (R1): recount `LnrgAccounted`. Under v0 a sale did not lower
     /// it, so it overstated the attributed LNRG in the vault by everything
