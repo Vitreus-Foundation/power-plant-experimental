@@ -5,7 +5,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [ main ]
   pull_request:
 
 env:
@@ -32,13 +32,10 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --features try-runtime
 
       - name: Benchmarks compile
         run: cargo check --workspace --locked --features runtime-benchmarks
-
-      - name: try-runtime compiles
-        run: cargo check --workspace --locked --features try-runtime
 
       # rustfmt.toml is power-plant's; the pinned toolchain's rustfmt and
       # power-plant's nightly check agree on every file here.
