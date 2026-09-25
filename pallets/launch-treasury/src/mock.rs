@@ -16,10 +16,10 @@
 //!   with a 1 % fee, paying from `BROKER`'s VTRS and burning the LNRG.
 //!   `InsufficientLiquidity` when `BROKER` is short, like the real one.
 //!
-//! `new_test_ext` is the upgrade path (the vault holds its ED and
-//! `VaultFunded` is set, as `FundLaunchTreasuryVault` leaves it);
-//! `new_test_ext_from_genesis` is the chain that ships the pallet at genesis
-//! (§9.6: nothing funds the vault, the first fee creates it).
+//! `new_test_ext` is the upgrade path: it runs `migrations::FundVault`
+//! itself, so every test below starts from the state the migration really
+//! produces. `new_test_ext_from_genesis` is the chain that ships the pallet
+//! at genesis (§9.6: nothing funds the vault, the first fee creates it).
 
 use super::*;
 use crate as pallet_launch_treasury;
@@ -652,8 +652,14 @@ pub fn pay_rewards(amount: u128) {
     Assets::mint_into(LNRG_ID, &vault(), amount).unwrap();
 }
 
-/// The upgrade path (§4, §7.4): `FundLaunchTreasuryVault` gave the vault
-/// its ED and set `VaultFunded` before any fee reached it.
+/// Run the upgrade that funds the vault (§7.4), as the runtime does.
+pub fn fund_vault() {
+    use frame_support::traits::OnRuntimeUpgrade;
+    crate::migrations::FundVault::<Test, TreasuryAccount>::on_runtime_upgrade();
+}
+
+/// The upgrade path (§4, §7.4): `FundVault` gave the vault its ED and set
+/// `VaultFunded` before any fee reached it.
 pub fn new_test_ext() -> sp_io::TestExternalities {
     build_ext(true)
 }
@@ -666,19 +672,18 @@ pub fn new_test_ext_from_genesis() -> sp_io::TestExternalities {
 
 fn build_ext(vault_funded: bool) -> sp_io::TestExternalities {
     let mut t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
-    let mut balances = vec![
+    let balances = vec![
         (ALICE, RICH),
         (BOB, RICH),
         (CHARLIE, RICH),
         (KEEPER, UNIT),
-        (TREASURY, ED),
+        // 2·ED, not ED: `FundVault` pays the vault's ED with `Preserve`,
+        // which a source sitting at its own ED cannot afford.
+        (TREASURY, 2 * ED),
         (EXCESS, ED),
         // The broker holds the gas market's VTRS float (§3.2).
         (BROKER, 1_000_000 * UNIT),
     ];
-    if vault_funded {
-        balances.push((vault(), ED));
-    }
     pallet_balances::GenesisConfig::<Test> { balances }
         .assimilate_storage(&mut t)
         .unwrap();
@@ -709,7 +714,8 @@ fn build_ext(vault_funded: bool) -> sp_io::TestExternalities {
         });
         RATE.with(|r| *r.borrow_mut() = (1, 1));
         if vault_funded {
-            VaultFunded::<Test>::put(true);
+            fund_vault();
+            assert!(VaultFunded::<Test>::get(), "the upgrade path funds the vault");
         }
         // Spec §2.6 pool split at tier 3: 5 protocol / 5 creator / 10 treasury / 10 pool.
         frame_support::assert_ok!(VitreusDex::set_default_fee_routing(

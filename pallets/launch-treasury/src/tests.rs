@@ -1518,7 +1518,109 @@ fn r7_burn_impact_is_bounded_under_the_venues_round_trip_fee() {
     });
 }
 
-// ---- fork-only migration ----------------------------------------------------
+// ---- migrations -------------------------------------------------------------
+
+/// The transfer path: with no vault account before the upgrade, `Source`
+/// pays exactly the ED and nothing more, and I-T1 counts the buffer from
+/// that block on instead of from the first fee (§2.2, §7.4).
+#[test]
+fn m_fund_vault_pays_the_ed_from_the_source() {
+    new_test_ext_from_genesis().execute_with(|| {
+        assert_eq!(vtrs(vault()), 0, "nothing funds the vault at genesis (§9.6)");
+        assert!(!VaultFunded::<Test>::get());
+        let t0 = vtrs(TREASURY);
+
+        fund_vault();
+
+        assert!(VaultFunded::<Test>::get());
+        assert_eq!(vtrs(vault()), ED, "the vault holds exactly its ED");
+        assert_eq!(t0 - vtrs(TREASURY), ED, "and the source paid exactly that");
+        #[cfg(feature = "try-runtime")]
+        {
+            use frame_support::traits::OnRuntimeUpgrade;
+            assert_ok!(crate::migrations::FundVault::<Test, TreasuryAccount>::post_upgrade(
+                Vec::new()
+            ));
+        }
+        ok_state();
+    });
+}
+
+/// A vault someone else already topped up to its ED costs the source
+/// nothing.
+#[test]
+fn m_fund_vault_leaves_an_already_funded_vault_alone() {
+    new_test_ext_from_genesis().execute_with(|| {
+        assert_ok!(Balances::transfer_allow_death(origin(ALICE), vault(), ED));
+        let t0 = vtrs(TREASURY);
+
+        fund_vault();
+
+        assert_eq!(vtrs(TREASURY), t0, "the source paid nothing");
+        assert_eq!(vtrs(vault()), ED);
+        assert!(VaultFunded::<Test>::get());
+        ok_state();
+    });
+}
+
+/// Nothing versions this migration, so a second run has to be free. The
+/// guard is what makes it so.
+#[test]
+fn m_fund_vault_is_idempotent() {
+    new_test_ext_from_genesis().execute_with(|| {
+        fund_vault();
+        let (t0, v0) = (vtrs(TREASURY), vtrs(vault()));
+
+        fund_vault();
+
+        assert_eq!(vtrs(TREASURY), t0, "the source paid once");
+        assert_eq!(vtrs(vault()), v0);
+        assert!(VaultFunded::<Test>::get());
+        ok_state();
+    });
+}
+
+/// A source that cannot pay must not brick the upgrade: the flag stays
+/// clear and §9.6 has the first fee withhold the ED instead.
+#[test]
+fn m_fund_vault_falls_back_to_the_first_fee_when_the_source_cannot_pay() {
+    new_test_ext_from_genesis().execute_with(|| {
+        // `Preserve` will not take the source below its own ED.
+        assert_ok!(Balances::transfer_allow_death(origin(TREASURY), ALICE, ED));
+        assert_eq!(vtrs(TREASURY), ED);
+
+        fund_vault();
+
+        assert!(!VaultFunded::<Test>::get(), "nothing was funded");
+        assert_eq!(vtrs(vault()), 0);
+
+        let a = create(ALICE);
+        buy(BOB, a, 100 * UNIT);
+        assert!(VaultFunded::<Test>::get(), "the first fee withheld it instead");
+        assert_eq!(vtrs(vault()), ED + treasury(a).pending);
+        ok_state();
+    });
+}
+
+/// Why `post_upgrade` earns its place: `try_state` passes over a failed
+/// transfer, because I-T1 drops the ED term while `VaultFunded` is false.
+#[cfg(feature = "try-runtime")]
+#[test]
+fn m_fund_vault_post_upgrade_catches_a_source_that_cannot_pay() {
+    use frame_support::{assert_err, traits::OnRuntimeUpgrade};
+    new_test_ext_from_genesis().execute_with(|| {
+        assert_ok!(Balances::transfer_allow_death(origin(TREASURY), ALICE, ED));
+        fund_vault();
+
+        // I-T1 drops the ED term while the flag is clear, so it passes.
+        assert_ok!(LaunchTreasury::do_try_state());
+        // `post_upgrade` does not, and fails on the flag, not the balance.
+        assert_err!(
+            crate::migrations::FundVault::<Test, TreasuryAccount>::post_upgrade(Vec::new()),
+            "FundVault: VaultFunded not set"
+        );
+    });
+}
 
 /// v1: the R1 recount. A chain that sold under the old rule has
 /// `LnrgAccounted` above what any launch can claim; after the recount it is
