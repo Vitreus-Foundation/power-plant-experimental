@@ -770,6 +770,13 @@ fn setup_reserved_asset() {
 }
 
 fn seed(who: u128) -> Result<u128, sp_runtime::DispatchError> {
+    // D10: a seed needs a default for its tier. Tests that are not about
+    // routing get the zero split, which is what they assumed before the
+    // default was per tier; the ones that are about routing set their own
+    // first, and the ones about the refusal call the trait directly.
+    if DefaultFeeRouting::<Test>::get(3).is_none() {
+        assert_ok!(VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 3, 0, 0, 0));
+    }
     <VitreusDex as crate::ReservedPoolSeeder<u128, NativeOrAssetId, u128, u64>>::seed_reserved_pool_for(
         &who,
         launch(),
@@ -1171,6 +1178,9 @@ fn seed_burns_pre_seed_donation_when_recipient_cannot_receive_it() {
         let escrow_native_before = Balances::free_balance(ESCROW);
         let escrow_token_before = Assets::balance(LAUNCH_ID, ESCROW);
 
+        // D10: set the tier's default here, not inside `seed`, so the
+        // `assert_noop!` below sees no storage write of its own.
+        assert_ok!(VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 3, 0, 0, 0));
         assert_noop!(seed(ESCROW), Error::<Test>::ExcessRecipientCannotReceive);
 
         // No pool, no position, nothing burned, nothing moved.
@@ -1356,13 +1366,30 @@ use crate::{
     ProtocolFeesUnclaimed,
 };
 
+/// D10: the default is per tier. These tests predate that and mean "the
+/// routing a new pool gets", so set every tier the whitelist allows, with
+/// the creator slice only where a launch pool can exist (tier 3 and 10).
 fn set_routing(protocol_bps: u16, creator_bps: u16) {
-    assert_ok!(VitreusDex::set_default_fee_routing(
-        RuntimeOrigin::root(),
-        protocol_bps,
-        creator_bps,
-        0
-    ));
+    // Tier 1 is 10 bps and keeps 5, so it takes the protocol slice only when
+    // the slice fits; these tests are about tiers 3 and 10 either way.
+    if protocol_bps <= pool_floor_bps(1) {
+        assert_ok!(VitreusDex::set_default_fee_routing(
+            RuntimeOrigin::root(),
+            1,
+            protocol_bps,
+            0,
+            0
+        ));
+    }
+    for tier in [3, 10] {
+        assert_ok!(VitreusDex::set_default_fee_routing(
+            RuntimeOrigin::root(),
+            tier,
+            protocol_bps,
+            creator_bps,
+            0
+        ));
+    }
 }
 
 fn escrow() -> u128 {
@@ -1395,7 +1422,8 @@ fn finding14_genesis_funds_the_fee_escrow() {
 #[test]
 fn d4_default_routing_is_zero_and_swaps_route_nothing() {
     new_test_ext().execute_with(|| {
-        assert_eq!(DefaultFeeRouting::<Test>::get(), FeeRouting::default());
+        // D10: unset is not zero — a seed at an unconfigured tier is refused.
+        assert_eq!(DefaultFeeRouting::<Test>::get(3), None);
         let key = seeded_launch_pool(0, 0);
         assert_eq!(Pools::<Test>::get(key.clone()).unwrap().routing, FeeRouting::default());
 
@@ -1420,36 +1448,52 @@ fn d4_default_routing_is_zero_and_swaps_route_nothing() {
 fn d4_set_default_fee_routing_validates_and_requires_manage_origin() {
     new_test_ext().execute_with(|| {
         assert_noop!(
-            VitreusDex::set_default_fee_routing(RuntimeOrigin::signed(ALICE), 5, 5, 0),
+            VitreusDex::set_default_fee_routing(RuntimeOrigin::signed(ALICE), 3, 5, 5, 0),
             sp_runtime::DispatchError::BadOrigin
         );
-        // 11 bps could not be carried by the 0.1% tier.
         assert_noop!(
-            // D9: the protocol slice alone must fit the smallest tier (a
-            // `create_pool` pool carries only that slice) ...
-            VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 11, 0, 0),
+            VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 2, 5, 5, 0),
+            Error::<Test>::InvalidFeeTier
+        );
+        // D10: tier 1 is 10 bps and keeps 5, so 6 does not fit ...
+        assert_noop!(
+            VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 1, 6, 0, 0),
             Error::<Test>::InvalidFeeRouting
         );
+        // ... and it can carry no creator or treasury slice at all.
         assert_noop!(
-            // ... and all three must fit the smallest launch tier.
-            VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 5, 5, 21),
+            VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 1, 0, 5, 0),
+            Error::<Test>::InvalidFeeRouting
+        );
+        // Tier 3 is 30 bps and keeps 10, so 21 does not fit.
+        assert_noop!(
+            VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 3, 5, 5, 11),
             Error::<Test>::InvalidFeeRouting
         );
         set_routing(5, 5);
         assert_eq!(
-            DefaultFeeRouting::<Test>::get(),
-            FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 0 }
+            DefaultFeeRouting::<Test>::get(3),
+            Some(FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 0 })
+        );
+        assert_eq!(
+            DefaultFeeRouting::<Test>::get(1),
+            Some(FeeRouting { protocol_bps: 5, creator_bps: 0, treasury_bps: 0 }),
+            "tier 1 carries the protocol slice alone"
         );
         System::assert_has_event(
             Event::DefaultFeeRoutingSet {
+                fee_tier: 3,
                 routing: FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 0 },
             }
             .into(),
         );
-        set_routing(10, 0);
-        assert_eq!(DefaultFeeRouting::<Test>::get().routed_bps(), 10);
-        assert_ok!(VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 5, 5, 20));
-        assert_eq!(DefaultFeeRouting::<Test>::get().routed_bps(), 30);
+        // D10: a tier-10 pool may route what a tier-3 pool cannot.
+        assert_ok!(VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 10, 5, 5, 60));
+        assert_eq!(DefaultFeeRouting::<Test>::get(10).unwrap().routed_bps(), 70);
+        assert_noop!(
+            VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 3, 5, 5, 60),
+            Error::<Test>::InvalidFeeRouting
+        );
     });
 }
 
@@ -1480,7 +1524,8 @@ fn d4_seed_snapshots_full_default_and_later_changes_never_touch_existing_pools()
             FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 0 }
         );
 
-        set_routing(10, 0);
+        // D10: tier 1 keeps 5 bps, so the new default's protocol slice is 4.
+        set_routing(4, 0);
         assert_eq!(
             Pools::<Test>::get(key).unwrap().routing,
             FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 0 },
@@ -1490,7 +1535,7 @@ fn d4_seed_snapshots_full_default_and_later_changes_never_touch_existing_pools()
         let usdc_key = VitreusDex::canonical_pair(native(), usdc());
         assert_eq!(
             Pools::<Test>::get(usdc_key).unwrap().routing,
-            FeeRouting { protocol_bps: 10, creator_bps: 0, treasury_bps: 0 }
+            FeeRouting { protocol_bps: 4, creator_bps: 0, treasury_bps: 0 }
         );
     });
 }
@@ -2069,16 +2114,35 @@ fn d8_migration_v2_moves_reserves_to_the_hash_derived_account() {
 
 use crate::{
     mock::{SINK_NOTED, SINK_VAULT, VAULT},
-    LastSwapBlock, MIN_FEE_TIER, MIN_LAUNCH_FEE_TIER,
+    pool_floor_bps, LastSwapBlock, MIN_FEE_TIER, MIN_LAUNCH_FEE_TIER, MIN_POOL_BPS,
 };
 
+/// Set the tiers a test needs. Tier 1 takes the protocol slice when it fits
+/// its 5 bps of room; tier 10 always fits what tier 3 does.
 fn set_routing3(protocol_bps: u16, creator_bps: u16, treasury_bps: u16) {
-    assert_ok!(VitreusDex::set_default_fee_routing(
-        RuntimeOrigin::root(),
-        protocol_bps,
-        creator_bps,
-        treasury_bps
-    ));
+    if protocol_bps <= pool_floor_bps(1) {
+        assert_ok!(VitreusDex::set_default_fee_routing(
+            RuntimeOrigin::root(),
+            1,
+            protocol_bps,
+            0,
+            0
+        ));
+    }
+    let routed = protocol_bps + creator_bps + treasury_bps;
+    for tier in [3, 10] {
+        if (FeeRouting { protocol_bps, creator_bps, treasury_bps }).is_valid_for(tier) {
+            assert_ok!(VitreusDex::set_default_fee_routing(
+                RuntimeOrigin::root(),
+                tier,
+                protocol_bps,
+                creator_bps,
+                treasury_bps
+            ));
+        } else {
+            assert!(routed > 0, "a zero split fits every tier");
+        }
+    }
 }
 
 fn seeded_launch_pool3(
@@ -2098,16 +2162,24 @@ fn d9_routing_is_tier_relative() {
     let r = FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 10 };
     assert!(r.is_valid_for(3) && r.is_valid_for(10));
     assert!(!r.is_valid_for(1), "20 bps does not fit a 10 bps tier");
+    // D10: the pool keeps a floor, so a pool may no longer route its whole tier.
+    assert_eq!((MIN_FEE_TIER, MIN_LAUNCH_FEE_TIER, MIN_POOL_BPS), (1, 3, 10));
+    assert_eq!((pool_floor_bps(1), pool_floor_bps(3), pool_floor_bps(10)), (5, 10, 10));
     assert!(
-        FeeRouting { protocol_bps: 10, creator_bps: 10, treasury_bps: 10 }.is_valid_for(3),
-        "a pool may route its whole tier"
+        !FeeRouting { protocol_bps: 10, creator_bps: 10, treasury_bps: 10 }.is_valid_for(3),
+        "30 bps leaves a 30 bps tier nothing"
     );
-    assert!(!FeeRouting { protocol_bps: 10, creator_bps: 10, treasury_bps: 11 }.is_valid_for(3));
-    // The default rule: protocol alone fits the smallest tier, all three fit the smallest launch tier.
-    assert_eq!((MIN_FEE_TIER, MIN_LAUNCH_FEE_TIER), (1, 3));
-    assert!(FeeRouting { protocol_bps: 10, creator_bps: 10, treasury_bps: 10 }.is_valid_default());
-    assert!(!FeeRouting { protocol_bps: 11, creator_bps: 0, treasury_bps: 0 }.is_valid_default());
-    assert!(!FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 21 }.is_valid_default());
+    assert!(FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 60 }.is_valid_for(10));
+    assert!(
+        !FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 81 }.is_valid_for(10),
+        "91 bps leaves a 100 bps tier less than the floor"
+    );
+    assert!(FeeRouting { protocol_bps: 5, creator_bps: 0, treasury_bps: 0 }.is_valid_for(1));
+    assert!(!FeeRouting { protocol_bps: 6, creator_bps: 0, treasury_bps: 0 }.is_valid_for(1));
+    // The arithmetic invariant is weaker, and is what `try_state` keeps: a
+    // pool created under the old bound still routes no more than it charges.
+    assert!(FeeRouting { protocol_bps: 10, creator_bps: 10, treasury_bps: 10 }.fits_tier(3));
+    assert!(!FeeRouting { protocol_bps: 10, creator_bps: 10, treasury_bps: 11 }.fits_tier(3));
 
     new_test_ext().execute_with(|| {
         // A tier-1 `create_pool` pool carries the protocol slice only, so a
@@ -2232,24 +2304,148 @@ fn d9_no_sink_folds_into_protocol() {
 #[test]
 fn d9_seed_rejects_a_split_the_tier_cannot_carry() {
     new_test_ext().execute_with(|| {
-        // A default that fits tier 3 but not tier 1 cannot be stored as
-        // invalid; what *can* happen is a valid default and a pool created
-        // at a tier that cannot carry it. `insert_new_pool` is the last
-        // line: routing 10/10/10 (30 bps) at tier 1 is refused, at tier 3
-        // it is the whole tier and accepted.
-        set_routing3(10, 10, 10);
+        // D10: the default is validated for its own tier when it is set, so
+        // a stored default the tier cannot carry no longer exists. Seeding
+        // at a tier with no default at all is what must be refused — a
+        // launch that graduated on a silent zero would feed its treasury
+        // nothing for the life of the pool.
         setup_reserved_asset();
         assert_noop!(
             <VitreusDex as crate::ReservedPoolSeeder<u128, NativeOrAssetId, u128, u64>>::seed_reserved_pool_for(
-                &ESCROW, launch(), native(), SEED_TOKEN, SEED_NATIVE, 1
+                &ESCROW, launch(), native(), SEED_TOKEN, SEED_NATIVE, 3
             ),
-            Error::<Test>::InvalidFeeRouting
+            Error::<Test>::NoDefaultFeeRouting
         );
+        // Tier 10 set, tier 3 forgotten: a tier-3 launch still stops.
+        assert_ok!(VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 10, 5, 5, 60));
+        assert_noop!(
+            <VitreusDex as crate::ReservedPoolSeeder<u128, NativeOrAssetId, u128, u64>>::seed_reserved_pool_for(
+                &ESCROW, launch(), native(), SEED_TOKEN, SEED_NATIVE, 3
+            ),
+            Error::<Test>::NoDefaultFeeRouting
+        );
+        // At the tier governance did set, it seeds and snapshots that split.
+        assert_ok!(<VitreusDex as crate::ReservedPoolSeeder<u128, NativeOrAssetId, u128, u64>>::seed_reserved_pool_for(
+            &ESCROW, launch(), native(), SEED_TOKEN, SEED_NATIVE, 10
+        ));
+        let key = VitreusDex::canonical_pair(native(), launch());
+        assert_eq!(
+            Pools::<Test>::get(key).unwrap().routing,
+            FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 60 }
+        );
+    });
+}
+
+#[test]
+fn d10_migration_moves_the_single_default_to_tier_three() {
+    use crate::migrations::{v3, v4::MigrateToV4};
+    use frame_support::traits::{GetStorageVersion, OnRuntimeUpgrade, StorageVersion};
+
+    new_test_ext().execute_with(|| {
+        // The pre-D10 world: one value, validated against tier 3 as it then
+        // was (routed ≤ 30, no pool floor).
+        v3::DefaultFeeRouting::<Test>::put(FeeRouting {
+            protocol_bps: 5,
+            creator_bps: 5,
+            treasury_bps: 10,
+        });
+        StorageVersion::new(3).put::<VitreusDex>();
+
+        MigrateToV4::<Test>::on_runtime_upgrade();
+
+        assert_eq!(VitreusDex::on_chain_storage_version(), StorageVersion::new(4));
+        assert!(!v3::DefaultFeeRouting::<Test>::exists(), "the old key is gone");
+        assert_eq!(
+            DefaultFeeRouting::<Test>::get(3),
+            Some(FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 10 })
+        );
+        assert_eq!(DefaultFeeRouting::<Test>::get(1), None, "tier 1 is governance's to set");
+        assert_eq!(DefaultFeeRouting::<Test>::get(10), None, "and so is tier 10");
+    });
+}
+
+#[test]
+fn d10_migration_drops_a_default_the_floor_no_longer_allows() {
+    use crate::migrations::{v3, v4::MigrateToV4};
+    use frame_support::traits::{OnRuntimeUpgrade, StorageVersion};
+
+    new_test_ext().execute_with(|| {
+        // 30 bps was the whole of tier 3 and legal before the pool floor.
+        v3::DefaultFeeRouting::<Test>::put(FeeRouting {
+            protocol_bps: 10,
+            creator_bps: 10,
+            treasury_bps: 10,
+        });
+        StorageVersion::new(3).put::<VitreusDex>();
+
+        MigrateToV4::<Test>::on_runtime_upgrade();
+
+        // Not clamped into a split nobody chose: dropped, and visible as a
+        // refused seed until governance sets the tier.
+        assert_eq!(DefaultFeeRouting::<Test>::get(3), None);
+        assert!(!v3::DefaultFeeRouting::<Test>::exists());
+        setup_reserved_asset();
+        assert_noop!(
+            <VitreusDex as crate::ReservedPoolSeeder<u128, NativeOrAssetId, u128, u64>>::seed_reserved_pool_for(
+                &ESCROW, launch(), native(), SEED_TOKEN, SEED_NATIVE, 3
+            ),
+            Error::<Test>::NoDefaultFeeRouting
+        );
+    });
+}
+
+#[test]
+fn d10_existing_pools_keep_their_snapshot_across_the_migration() {
+    use crate::migrations::v4::MigrateToV4;
+    use frame_support::traits::{OnRuntimeUpgrade, StorageVersion};
+
+    new_test_ext().execute_with(|| {
+        // A pool as the old bound could create it, routing its whole tier.
+        // D10's setter will not store such a split any more, so the record
+        // is written the way the chain already holds it.
+        let key = seeded_launch_pool3(5, 5, 10);
+        let legacy = FeeRouting { protocol_bps: 10, creator_bps: 10, treasury_bps: 10 };
+        Pools::<Test>::mutate(key.clone(), |p| p.as_mut().unwrap().routing = legacy);
+        let before = Pools::<Test>::get(key.clone()).unwrap().routing;
+        assert_eq!(before.routed_bps(), 30);
+        assert!(!before.is_valid_for(3), "D10 would not create this pool today");
+        assert!(before.fits_tier(3), "but it still routes no more than it charges");
+
+        StorageVersion::new(3).put::<VitreusDex>();
+        MigrateToV4::<Test>::on_runtime_upgrade();
+
+        assert_eq!(
+            Pools::<Test>::get(key).unwrap().routing,
+            before,
+            "routing is a snapshot; the migration does not revisit it"
+        );
+    });
+}
+
+#[test]
+fn d10_unset_tier_blocks_a_seed_but_not_a_create_pool() {
+    new_test_ext().execute_with(|| {
+        // A governance pool has no creator and no treasury, so an
+        // unconfigured tier means it routes nothing — as before any default
+        // was ever set. It must not be blocked.
+        assert_ok!(VitreusDex::create_pool(RuntimeOrigin::root(), native(), usdc(), 3));
+        assert_eq!(
+            Pools::<Test>::get(VitreusDex::canonical_pair(native(), usdc())).unwrap().routing,
+            FeeRouting::default()
+        );
+        // A seed at the same unconfigured tier is refused, and succeeds once
+        // governance sets it.
+        setup_reserved_asset();
+        assert_noop!(
+            <VitreusDex as crate::ReservedPoolSeeder<u128, NativeOrAssetId, u128, u64>>::seed_reserved_pool_for(
+                &ESCROW, launch(), native(), SEED_TOKEN, SEED_NATIVE, 3
+            ),
+            Error::<Test>::NoDefaultFeeRouting
+        );
+        assert_ok!(VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 3, 5, 5, 10));
         assert_ok!(<VitreusDex as crate::ReservedPoolSeeder<u128, NativeOrAssetId, u128, u64>>::seed_reserved_pool_for(
             &ESCROW, launch(), native(), SEED_TOKEN, SEED_NATIVE, 3
         ));
-        let key = VitreusDex::canonical_pair(native(), launch());
-        assert_eq!(Pools::<Test>::get(key).unwrap().routing.routed_bps(), 30);
     });
 }
 
@@ -2289,14 +2485,13 @@ fn d9_swap_for_native_reserves_and_last_swap_block() {
 #[test]
 fn d9_migration_v3_widens_routing_on_every_pool_and_the_default() {
     use crate::migrations::v3::{MigrateToV3, OldFeeRouting, OldPoolInfo};
-    use crate::DefaultFeeRouting;
     use frame_support::{
         storage::unhashed,
         traits::{GetStorageVersion, OnRuntimeUpgrade, StorageVersion},
     };
 
     new_test_ext().execute_with(|| {
-        assert_ok!(VitreusDex::set_default_fee_routing(RuntimeOrigin::root(), 5, 5, 0));
+        set_routing(5, 5);
         assert_ok!(VitreusDex::create_pool(RuntimeOrigin::root(), native(), usdc(), 3));
         assert_ok!(VitreusDex::add_liquidity(
             RuntimeOrigin::signed(ALICE),
@@ -2323,7 +2518,7 @@ fn d9_migration_v3_widens_routing_on_every_pool_and_the_default() {
             },
         );
         unhashed::put(
-            &DefaultFeeRouting::<Test>::hashed_key(),
+            &crate::migrations::v3::DefaultFeeRouting::<Test>::hashed_key(),
             &OldFeeRouting { protocol_bps: 5, creator_bps: 5 },
         );
         StorageVersion::new(2).put::<VitreusDex>();
@@ -2345,8 +2540,8 @@ fn d9_migration_v3_widens_routing_on_every_pool_and_the_default() {
             (pool.reserve_a, pool.reserve_b, pool.pool_account)
         );
         assert_eq!(
-            DefaultFeeRouting::<Test>::get(),
-            FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 0 }
+            crate::migrations::v3::DefaultFeeRouting::<Test>::get(),
+            Some(FeeRouting { protocol_bps: 5, creator_bps: 5, treasury_bps: 0 })
         );
         // The pool trades under its snapshot.
         assert_ok!(VitreusDex::swap_exact_tokens_for_tokens(
