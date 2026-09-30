@@ -275,7 +275,7 @@ pub fn buy(
     launch_id: LaunchId,
     quote_in: BalanceOf<T>,        // exact VTRS input, gross of fee
     min_tokens_out: BalanceOf<T>,
-) -> DispatchResult
+) -> DispatchResultWithPostInfo    // Pays::No above the §2.10 threshold
 ```
 
 Preconditions: launch exists; `phase == Trading`; `quote_in > 0`.
@@ -301,7 +301,7 @@ pub fn sell(
     launch_id: LaunchId,
     tokens_in: BalanceOf<T>,
     min_quote_out: BalanceOf<T>,
-) -> DispatchResult
+) -> DispatchResultWithPostInfo    // Pays::No above the §2.10 threshold
 ```
 
 Preconditions: launch exists; `phase == Trading` (sells revert in `Complete` — FM-08 — and in `Graduated`, where the pool is the venue); `tokens_in > 0`; `tokens_in ≤ SELLABLE − tokens_remaining` (cannot sell more than the curve has sold; `ArithmeticOverflow` otherwise, which can only happen if I3 is broken).
@@ -382,6 +382,26 @@ pub fn set_launch_metadata(origin: OriginFor<T>, launch_id: LaunchId, metadata: 
 Replaces `Metadata[launch_id]` whole. Origin must be the current `creator_fee_recipient` — the same authority as §2.6, and it travels with that role: after `set_creator_fee_recipient`, the new recipient edits and the old one cannot. No governance override. Allowed in every phase; a graduated token's page is still the creator's to maintain. Emits `LaunchMetadataSet{launch_id}`. Metadata may also be supplied at creation through `create_launch`'s last argument, which writes the same record.
 
 **Nothing in the metadata is enforced or verified on chain.** The pallet stores the bytes it is given, bounded only by `UriLimit` / `DescriptionLimit`, and returns them verbatim. It does not check that `image` is a URI or that it resolves, that `website` is a URL, that `twitter` is a handle, that `description` is UTF-8, or that any field is unique — exactly as name and symbol are not checked (`fm16_name_symbol_not_enforced_on_chain`). The bounds exist to cap storage per launch (DoS), not to validate. At the runtime's 256 / 1024 that is up to ~2 KB of storage per launch with no separate deposit; the lever if metadata spam ever becomes a problem is the **creation fee** — `Params.creation_fee` is governance-settable through `set_params` (§2.8) — not a new storage deposit. Recorded here as the known lever, not a gap. A frontend must treat every field as untrusted user input: escape it, never render it as HTML, resolve `image` inside a fixed-size sandboxed box with a generated fallback, and expect junk. Weight: `set_launch_metadata(d, u)` and the `d`, `u` components of `create_launch(n, s, d, u)` are the description length and the longest URI length.
+
+
+### 2.10 Free trades (`Pays::No` above a threshold)
+
+A successful `buy` (§2.2) or `sell` (§2.3) whose traded quote is at or above the launch's **free-trade threshold** returns `Pays::No`: the energy fee withdrawn before dispatch is refunded. Everything else pays as before — a trade below the threshold, a failed trade, `create_launch` including its first buy (§2.1), `graduate`, and every other call. Below the threshold a trade is never refused; the threshold decides only whether it is free.
+
+```
+threshold = FreeTradeFee × BPS² / (curve_fee_bps × (protocol_share_bps + treasury_share_bps))    (rounded up)
+```
+
+- **Traded quote.** A buy is measured on `quote_used` (gross of the curve fee) — what was actually taken, which on a crossing buy can be less than `quote_in`. A sell is measured on `quote_gross = quote_out + fee`. Both legs are gross, so a round trip is judged the same way in each direction.
+- **`FreeTradeFee`** (Config) is what one signed launchpad call is charged in energy, expressed in quote units at the current energy price — what a holder of only the quote asset pays for it. The runtime derives it from the energy exchange rate and the broker's swap fee, so the threshold follows the energy price; a value no trade can reach (the runtime returns `u128::MAX` while the rate is unset) makes nothing free.
+- **Why 200× at the default split.** A free call must cost whoever makes it at least the fee it skips, or free calls are free block space. The cheapest spammer is a launch's own creator, who gets the creator share of the curve fee back, so a trade costs them `curve_fee_bps × (protocol + treasury share)` of the quote; a buy followed by an immediate sell on the curve loses nothing else. At 100 bps with half the fee going to protocol and treasury that is 0.5 % a leg, so the threshold is 200 × the fee. The terms come from the launch's snapshot (§1.2), so each launch's threshold follows its own split; with no curve fee or no non-creator share, nothing is free.
+- **Why energy, not VTRS or USD.** The energy fee in VTRS moved from 8.4 to 19.7 over two weeks in September 2026. A fixed VTRS amount would drift away from the fee it is meant to cover; a USD amount needs an oracle. The energy rate is on chain and is exactly what a free call avoids paying.
+- **What it does for a VTRS-only user.** The fee is taken before dispatch — bought from the energy broker when the signer holds no energy — and a `Pays::No` refund is deposited back to the signer as VNRG, not to the broker. A VTRS-only buyer's first free trade therefore costs one broker purchase, which they keep as energy; later free trades draw nothing from the broker, and a failed call spends it. The broker drains once per new user rather than once per call.
+- **Cost to the chain.** A free trade burns no energy, so launchpad activity above the threshold does not raise the broker's capacity (its 14-day burn) or feed the treasury's recycled share of fees. Agreed in principle with the Vitreus Foundation, September 2026.
+
+> **The placeholder graduation target makes this inert.** The runtime default `graduation_target` is a placeholder of 3,000 VTRS. At an energy fee of ~16 VTRS (September 2026) the threshold is ~3,200 VTRS — more than such a launch's whole curve takes — so **no trade on a 3,000 VTRS launch can ever be free**, not even the one that crosses (`at_the_placeholder_target_no_trade_can_be_free`). That is an argument about the target, not the threshold: whoever sets the real `graduation_target` should set it large against 200 × the energy fee, or free trades will not exist.
+
+Tests: `tests::free_trades` — the 200× derivation and its dependence on the launch's split and on the fee; no fee or no non-creator share, and an unreachable fee, make nothing free; a buy at the threshold is free and one unit below pays; failed buys and sells pay; a crossing buy is judged on the quote it took; a sell is judged gross; weight accounting is unchanged; creation is never free; the placeholder target.
 
 ## 3. Curve math
 

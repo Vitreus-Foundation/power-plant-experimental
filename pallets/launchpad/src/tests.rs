@@ -973,7 +973,7 @@ fn fm09_rounding_always_favours_pool() {
                     let quote = Launchpad::quote_sell(id, amt);
                     let res = Launchpad::sell(origin(&who), id, amt, 0);
                     match (quote, res) {
-                        (Ok(q), Ok(())) => {
+                        (Ok(q), Ok(_)) => {
                             // I13 sell: q_gross · (Tk + t_in) ≤ t_in · Q
                             let tk0 = t.token_floor + s0.tokens_remaining;
                             let lhs = U256::from(q.quote_gross) * U256::from(tk0 + amt);
@@ -981,7 +981,7 @@ fn fm09_rounding_always_favours_pool() {
                             assert!(lhs <= rhs, "I13 sell");
                         },
                         (Err(e), Err(e2)) => {
-                            assert_eq!(e, e2);
+                            assert_eq!(e, e2.error);
                             assert_eq!(state(id), s0);
                             assert_eq!(e, Error::<Test>::Unquotable.into());
                         },
@@ -2110,4 +2110,178 @@ fn l1_migration_v1_re_encodes_pre_l1_launches_curves_and_params() {
         MigrateToV1::<Test>::on_runtime_upgrade();
         assert_eq!(Launches::<Test>::get(a).unwrap().curve.treasury_share_bps, 0);
     });
+}
+
+// ---- §2.10: free trades above 200× the energy fee -----------------------
+
+mod free_trades {
+    use super::*;
+    use frame_support::dispatch::Pays;
+
+    fn pays_buy(who: &Acc, id: LaunchId, q: u128) -> Pays {
+        Launchpad::buy(origin(who), id, q, 0).expect("buy succeeds").pays_fee
+    }
+    fn pays_sell(who: &Acc, id: LaunchId, t: u128) -> Pays {
+        Launchpad::sell(origin(who), id, t, 0).expect("sell succeeds").pays_fee
+    }
+    fn curve_of(id: LaunchId) -> crate::CurveParams<u128> {
+        launch(id).curve
+    }
+
+    #[test]
+    fn threshold_is_200x_the_fee_at_one_percent_and_half_to_the_creator() {
+        new_test_ext().execute_with(|| {
+            set_free_trade_fee(UNIT);
+            let id = create(ALICE);
+            // 100 bps, protocol 5,000 + treasury 0 → BPS² / (100 × 5,000) = 200.
+            assert_eq!(Launchpad::free_trade_threshold(&curve_of(id)), Some(200 * UNIT));
+        });
+    }
+
+    #[test]
+    fn threshold_follows_the_launchs_own_split_and_the_fee() {
+        new_test_ext().execute_with(|| {
+            set_free_trade_fee(UNIT);
+            let old = create(ALICE);
+            // A later launch with a 2% curve fee (same 50% non-creator share):
+            // a spammer loses twice as much per trade, so 100×.
+            set_params(T_DEFAULT, 200, 5_000);
+            let new = create(BOB);
+            assert_eq!(Launchpad::free_trade_threshold(&curve_of(new)), Some(100 * UNIT));
+            // The earlier launch keeps its snapshot.
+            assert_eq!(Launchpad::free_trade_threshold(&curve_of(old)), Some(200 * UNIT));
+            // And both follow the energy price.
+            set_free_trade_fee(2 * UNIT);
+            assert_eq!(Launchpad::free_trade_threshold(&curve_of(old)), Some(400 * UNIT));
+        });
+    }
+
+    #[test]
+    fn no_fee_or_no_non_creator_share_means_nothing_is_free() {
+        new_test_ext().execute_with(|| {
+            set_free_trade_fee(UNIT);
+            let mut c = curve_of(create(ALICE));
+            c.curve_fee_bps = 0;
+            assert_eq!(Launchpad::free_trade_threshold(&c), None);
+            let mut c = curve_of(create(BOB));
+            c.protocol_share_bps = 0;
+            c.treasury_share_bps = 0;
+            assert_eq!(Launchpad::free_trade_threshold(&c), None);
+            // An unreachable fee (the mock default, and the runtime's before
+            // the energy rate exists) overflows to None too.
+            set_free_trade_fee(u128::MAX);
+            assert_eq!(Launchpad::free_trade_threshold(&curve_of(create(CHARLIE))), None);
+        });
+    }
+
+    #[test]
+    fn buy_is_free_at_or_above_the_threshold_and_pays_below() {
+        new_test_ext().execute_with(|| {
+            set_free_trade_fee(UNIT);
+            let id = create(ALICE);
+            assert_eq!(pays_buy(&BOB, id, 200 * UNIT), Pays::No);
+            assert_eq!(pays_buy(&BOB, id, 200 * UNIT - 1), Pays::Yes);
+            assert_eq!(pays_buy(&BOB, id, 10 * UNIT), Pays::Yes);
+        });
+    }
+
+    #[test]
+    fn a_failed_buy_or_sell_pays() {
+        new_test_ext().execute_with(|| {
+            set_free_trade_fee(UNIT);
+            let id = create(ALICE);
+            let e = Launchpad::buy(origin(&BOB), id, 500 * UNIT, u128::MAX).unwrap_err();
+            assert_eq!(e.error, Error::<Test>::SlippageExceeded.into());
+            assert_eq!(e.post_info.pays_fee, Pays::Yes);
+            buy(&BOB, id, 500 * UNIT);
+            let t = tok(id, &BOB);
+            let e = Launchpad::sell(origin(&BOB), id, t, u128::MAX).unwrap_err();
+            assert_eq!(e.post_info.pays_fee, Pays::Yes);
+        });
+    }
+
+    #[test]
+    fn a_crossing_buy_is_judged_on_the_quote_it_took_not_the_quote_offered() {
+        new_test_ext().execute_with(|| {
+            set_free_trade_fee(UNIT);
+            let id = create(ALICE);
+            // Take the curve close to the end, then cross with a huge offer.
+            buy(&BOB, id, 2_900 * UNIT);
+            let before = vtrs(&CHARLIE);
+            let pays = pays_buy(&CHARLIE, id, 500_000 * UNIT);
+            let taken = before - vtrs(&CHARLIE);
+            assert_ne!(state(id).phase, crate::Phase::Trading, "the buy crossed");
+            assert!(taken < 200 * UNIT, "the cross took {taken}, under the threshold");
+            assert_eq!(pays, Pays::Yes);
+        });
+    }
+
+    #[test]
+    fn sell_is_judged_gross_of_the_curve_fee() {
+        new_test_ext().execute_with(|| {
+            let id = create(ALICE);
+            buy(&BOB, id, 1_000 * UNIT);
+            set_free_trade_fee(UNIT);
+            let held = tok(id, &BOB);
+            // A small slice: gross under 200 → pays.
+            let small = held / 100;
+            assert!(Launchpad::quote_sell(id, small).unwrap().quote_gross < 200 * UNIT);
+            assert_eq!(pays_sell(&BOB, id, small), Pays::Yes);
+            // The rest: gross over 200 → free.
+            let rest = tok(id, &BOB);
+            assert!(Launchpad::quote_sell(id, rest).unwrap().quote_gross >= 200 * UNIT);
+            assert_eq!(pays_sell(&BOB, id, rest), Pays::No);
+        });
+    }
+
+    #[test]
+    fn weight_accounting_is_unchanged() {
+        new_test_ext().execute_with(|| {
+            set_free_trade_fee(UNIT);
+            let id = create(ALICE);
+            let post = Launchpad::buy(origin(&BOB), id, 300 * UNIT, 0).unwrap();
+            assert_eq!(post.actual_weight, Some(<() as crate::WeightInfo>::buy()));
+            assert_eq!(post.pays_fee, Pays::No);
+        });
+    }
+
+    #[test]
+    fn creation_is_never_free_even_with_a_large_first_buy() {
+        new_test_ext().execute_with(|| {
+            set_free_trade_fee(UNIT);
+            let post = Launchpad::create_launch(
+                origin(&ALICE),
+                bv(b"Meme"),
+                bv(b"MEME"),
+                None,
+                1_000 * UNIT,
+                0,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(post.pays_fee, Pays::Yes);
+        });
+    }
+
+    /// Written down where whoever sets the real target will see it: at the
+    /// placeholder 3,000-unit graduation target and an energy fee of ~16 VTRS
+    /// (September 2026) the threshold is 3,200, more than the whole curve
+    /// takes, so no trade on such a launch can ever be free — not even the
+    /// one that crosses. The target is what has to move.
+    #[test]
+    fn at_the_placeholder_target_no_trade_can_be_free() {
+        new_test_ext().execute_with(|| {
+            set_free_trade_fee(16 * UNIT);
+            let id = create(ALICE);
+            assert_eq!(T_DEFAULT, 3_000 * UNIT);
+            assert_eq!(Launchpad::free_trade_threshold(&curve_of(id)), Some(3_200 * UNIT));
+            let before = vtrs(&BOB);
+            assert_eq!(pays_buy(&BOB, id, 500_000 * UNIT), Pays::Yes);
+            assert!(
+                before - vtrs(&BOB) < 3_200 * UNIT,
+                "the whole curve costs less than the threshold"
+            );
+        });
+    }
 }

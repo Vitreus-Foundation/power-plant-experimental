@@ -481,7 +481,7 @@ fn run(op: &Op) -> Option<Result<(), DispatchError>> {
             if tokens == 0 {
                 return None;
             }
-            Launchpad::sell(origin(&w), id, tokens, 0)
+            Launchpad::sell(origin(&w), id, tokens, 0).map(|_| ()).map_err(|e| e.error)
         },
         Op::ClaimCreatorFees { launch } => {
             let id = launch_at(*launch)?;
