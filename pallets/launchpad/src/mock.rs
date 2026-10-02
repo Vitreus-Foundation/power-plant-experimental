@@ -284,6 +284,21 @@ impl sp_runtime::traits::Convert<u128, NativeOrAssetId> for IntoAssetKind {
 /// `(launch_id, launch_created_at, now, who, is_creator, quote_in)` as the hook saw it.
 pub type HookCall = (LaunchId, u64, u64, Acc, bool, u128);
 
+// §2.10: the energy fee in quote units, per test. The default makes no
+// trade free, so tests that do not set it see the pre-§2.10 behaviour.
+thread_local! {
+    pub static FREE_TRADE_FEE: RefCell<u128> = const { RefCell::new(u128::MAX) };
+}
+pub struct FreeTradeFee;
+impl Get<u128> for FreeTradeFee {
+    fn get() -> u128 {
+        FREE_TRADE_FEE.with(|f| *f.borrow())
+    }
+}
+pub fn set_free_trade_fee(fee: u128) {
+    FREE_TRADE_FEE.with(|f| *f.borrow_mut() = fee);
+}
+
 thread_local! {
     pub static HOOK_CALLS: RefCell<Vec<HookCall>> = const { RefCell::new(Vec::new()) };
     pub static HOOK_BLACKLIST: RefCell<Option<Acc>> = const { RefCell::new(None) };
@@ -350,6 +365,7 @@ impl pallet_launchpad::Config for Test {
     type DescriptionLimit = ConstU32<1024>;
     type DefaultLaunchParams = DefaultLaunchParams;
     type BuyHook = RecordingHook;
+    type FreeTradeFee = FreeTradeFee;
     type WeightInfo = ();
 }
 

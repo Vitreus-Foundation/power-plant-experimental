@@ -260,7 +260,7 @@ impl<A, B: Zero, N> OnCurveBuy<A, B, N> for () {
 #[frame_support::pallet]
 pub mod pallet {
     use super::*;
-    use frame_support::pallet_prelude::*;
+    use frame_support::{dispatch::PostDispatchInfo, pallet_prelude::*};
     use frame_system::pallet_prelude::*;
 
     /// v1 (L1): `treasury_share_bps` on the params, `treasury_fees_paid` and
@@ -366,6 +366,13 @@ pub mod pallet {
 
         /// Anti-snipe hook; `()` in v1.
         type BuyHook: OnCurveBuy<Self::AccountId, BalanceOf<Self>, BlockNumberFor<Self>>;
+
+        /// §2.10: what one signed launchpad call is charged in energy,
+        /// expressed in quote base units at the current energy price — what a
+        /// holder of only the quote asset pays for it. It prices the free-trade
+        /// threshold. A value no trade can reach (e.g. `u128::MAX` while the
+        /// energy rate is unset) makes nothing free.
+        type FreeTradeFee: Get<BalanceOf<Self>>;
 
         /// Weight information for the extrinsics of this pallet.
         type WeightInfo: WeightInfo;
@@ -640,7 +647,8 @@ pub mod pallet {
             // 8. optional atomic first buy. Charged as a crossing buy up front;
             // refunded to a plain buy when the curve was not exhausted.
             if !initial_buy.is_zero() {
-                let (crossed, _) =
+                // Not §2.10-free: creation pays its own fee, first buy included.
+                let (crossed, _, _) =
                     Self::do_buy(&creator, id, initial_buy, min_tokens_out, true, true)?;
                 if !crossed {
                     let w = <T as Config>::WeightInfo::create_launch(
@@ -659,6 +667,9 @@ pub mod pallet {
         /// §2.2. Whether the buy crosses is state-dependent, so the crossing
         /// weight (partial fill + pool creation + seed + lock) is charged up
         /// front and refunded to `buy()` when the curve was not exhausted.
+        /// Free when it succeeds at or above the §2.10 threshold, measured on
+        /// the quote actually taken (a crossing buy can take less than
+        /// `quote_in`).
         #[pallet::call_index(1)]
         #[pallet::weight(<T as Config>::WeightInfo::buy_crossing())]
         pub fn buy(
@@ -669,7 +680,7 @@ pub mod pallet {
         ) -> DispatchResultWithPostInfo {
             let who = ensure_signed(origin)?;
             let launch = Launches::<T>::get(launch_id).ok_or(Error::<T>::LaunchNotFound)?;
-            let (crossed, _) = Self::do_buy(
+            let (crossed, _, quote_used) = Self::do_buy(
                 &who,
                 launch_id,
                 quote_in,
@@ -677,10 +688,13 @@ pub mod pallet {
                 who == launch.creator,
                 true,
             )?;
-            Ok(if crossed { None } else { Some(<T as Config>::WeightInfo::buy()) }.into())
+            Ok(PostDispatchInfo {
+                actual_weight: if crossed { None } else { Some(<T as Config>::WeightInfo::buy()) },
+                pays_fee: Self::pays_for(&launch.curve, quote_used),
+            })
         }
 
-        /// §2.3
+        /// §2.3. Free when it succeeds at or above the §2.10 threshold.
         #[pallet::call_index(2)]
         #[pallet::weight(<T as Config>::WeightInfo::sell())]
         pub fn sell(
@@ -688,9 +702,14 @@ pub mod pallet {
             launch_id: LaunchId,
             tokens_in: BalanceOf<T>,
             min_quote_out: BalanceOf<T>,
-        ) -> DispatchResult {
+        ) -> DispatchResultWithPostInfo {
             let who = ensure_signed(origin)?;
-            Self::do_sell(&who, launch_id, tokens_in, min_quote_out)
+            let launch = Launches::<T>::get(launch_id).ok_or(Error::<T>::LaunchNotFound)?;
+            let traded = Self::do_sell(&who, launch_id, tokens_in, min_quote_out)?;
+            Ok(PostDispatchInfo {
+                actual_weight: None,
+                pays_fee: Self::pays_for(&launch.curve, traded),
+            })
         }
 
         /// §2.4 — permissionless retry of seeding. Not nested: a failure is
@@ -1096,7 +1115,7 @@ pub mod pallet {
             min_tokens_out: BalanceOf<T>,
             is_creator: bool,
             is_trade: bool,
-        ) -> Result<(bool, BalanceOf<T>), DispatchError> {
+        ) -> Result<(bool, BalanceOf<T>, BalanceOf<T>), DispatchError> {
             let launch = Launches::<T>::get(launch_id).ok_or(Error::<T>::LaunchNotFound)?;
             let mut state = Curves::<T>::get(launch_id).ok_or(Error::<T>::LaunchNotFound)?;
             ensure!(state.phase == Phase::Trading, Error::<T>::WrongPhase);
@@ -1178,16 +1197,67 @@ pub mod pallet {
                     Self::deposit_event(Event::GraduationDeferred { launch_id, error });
                 }
             }
-            Ok((crossed, tokens_out))
+            Ok((crossed, tokens_out, q.quote_used.into()))
         }
 
-        /// §2.3 body.
+        /// §2.10: the smallest trade, in quote base units gross of the curve
+        /// fee, whose successful `buy` or `sell` is `Pays::No`; `None` when no
+        /// trade on this launch can be free.
+        ///
+        /// A free call must cost whoever makes it at least the fee it skips,
+        /// or free calls are free block space. What a trade costs the cheapest
+        /// possible spammer — the launch's own creator, who gets the creator
+        /// share of the curve fee back — is `curve_fee_bps × (protocol +
+        /// treasury share)` of the quote; a buy and an immediate sell on the
+        /// curve lose nothing else. So the threshold is
+        ///
+        /// `FreeTradeFee × BPS² / (curve_fee_bps × (protocol_share_bps + treasury_share_bps))`
+        ///
+        /// — 200 × the fee at 100 bps with a 50% non-creator share — taken
+        /// from the launch's snapshot, so a launch's threshold follows its own
+        /// split, and from `FreeTradeFee`, so it follows the energy price.
+        ///
+        /// Below the threshold a trade still succeeds and pays as before; the
+        /// threshold decides only whether it is free.
+        ///
+        /// The threshold can exceed a launch's whole curve. At the placeholder
+        /// runtime default graduation target of 3,000 VTRS and an energy fee
+        /// of ~16 VTRS (September 2026) it is ~3,200 VTRS, so no trade on such
+        /// a launch can ever be free. That is an argument about the
+        /// graduation target, not the threshold: a real target must be large
+        /// against 200 × the fee for free trades to exist at all.
+        pub fn free_trade_threshold(curve: &CurveParams<BalanceOf<T>>) -> Option<BalanceOf<T>> {
+            let non_creator_bps = (curve.protocol_share_bps as u128
+                + curve.treasury_share_bps as u128)
+                .min(BPS as u128);
+            let denom = curve.curve_fee_bps as u128 * non_creator_bps;
+            if denom == 0 {
+                return None;
+            }
+            let fee: u128 = T::FreeTradeFee::get().into();
+            // In U256, like every other product here (FM-09). Rounded up, so a
+            // trade exactly at the threshold still costs at least the fee. A
+            // threshold past u128 (an unreachable fee) means nothing is free.
+            let bps2 = U256::from(BPS) * U256::from(BPS);
+            let t = (U256::from(fee) * bps2 + U256::from(denom - 1)) / U256::from(denom);
+            u128::try_from(t).ok().map(Into::into)
+        }
+
+        /// `Pays::No` for a successful trade of `traded` quote at or above §2.10's threshold.
+        pub fn pays_for(curve: &CurveParams<BalanceOf<T>>, traded: BalanceOf<T>) -> Pays {
+            match Self::free_trade_threshold(curve) {
+                Some(t) if traded >= t => Pays::No,
+                _ => Pays::Yes,
+            }
+        }
+
+        /// §2.3 body. Returns the quote traded, gross of the curve fee.
         pub fn do_sell(
             who: &T::AccountId,
             launch_id: LaunchId,
             tokens_in: BalanceOf<T>,
             min_quote_out: BalanceOf<T>,
-        ) -> DispatchResult {
+        ) -> Result<BalanceOf<T>, DispatchError> {
             let launch = Launches::<T>::get(launch_id).ok_or(Error::<T>::LaunchNotFound)?;
             let mut state = Curves::<T>::get(launch_id).ok_or(Error::<T>::LaunchNotFound)?;
             ensure!(state.phase == Phase::Trading, Error::<T>::WrongPhase);
@@ -1236,7 +1306,8 @@ pub mod pallet {
                 fee: q.fee.into(),
                 quote_out,
             });
-            Ok(())
+            // Gross of the curve fee, like `quote_used` on a buy: what §2.10 measures.
+            Ok(quote_out.saturating_add(q.fee.into()))
         }
 
         /// §4.3 — the only path that moves curve funds to the pool.
@@ -1382,7 +1453,7 @@ pub mod pallet {
             let launch = Launches::<T>::get(launch_id).ok_or(Error::<T>::LaunchNotFound)?;
             // An in-runtime buy on the token's behalf is not a trade for the
             // dormancy clock (R2).
-            let (_, tokens_out) = Self::do_buy(
+            let (_, tokens_out, _) = Self::do_buy(
                 who,
                 launch_id,
                 quote_in,

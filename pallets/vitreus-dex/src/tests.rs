@@ -193,6 +193,43 @@ fn test_swap_exact_tokens() {
 }
 
 #[test]
+fn d11_swap_pays_out_to_the_signer_only() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(VitreusDex::create_pool(RuntimeOrigin::root(), usdc(), vnrg(), 10,));
+        assert_ok!(VitreusDex::add_liquidity(
+            RuntimeOrigin::signed(ALICE),
+            usdc(),
+            vnrg(),
+            10_000,
+            10_000,
+            0,
+            0,
+        ));
+        // Paying out to anyone but the signer fails, and changes nothing.
+        assert_noop!(
+            VitreusDex::swap_exact_tokens_for_tokens(
+                RuntimeOrigin::signed(BOB),
+                usdc(),
+                vnrg(),
+                100,
+                0,
+                CHARLIE,
+            ),
+            Error::<Test>::RecipientNotSigner
+        );
+        // The same swap to the signer goes through.
+        assert_ok!(VitreusDex::swap_exact_tokens_for_tokens(
+            RuntimeOrigin::signed(BOB),
+            usdc(),
+            vnrg(),
+            100,
+            0,
+            BOB,
+        ));
+    });
+}
+
+#[test]
 fn test_swap_insufficient_liquidity() {
     new_test_ext().execute_with(|| {
         assert_ok!(VitreusDex::create_pool(RuntimeOrigin::root(), usdc(), vnrg(), 10,));

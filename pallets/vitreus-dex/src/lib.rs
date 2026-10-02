@@ -962,6 +962,8 @@ pub mod pallet {
         InvalidAmount,
         /// Swap output did not meet the user's slippage bound.
         SlippageProtectionFailed,
+        /// D11: `swap_exact_tokens_for_tokens` pays out to the signer only.
+        RecipientNotSigner,
     }
 
     #[pallet::hooks]
@@ -1107,6 +1109,14 @@ pub mod pallet {
         }
 
         /// Swap an exact amount of `asset_in` for as much `asset_out` as the pool yields.
+        ///
+        /// D11: `recipient` must be the signer (`RecipientNotSigner` otherwise).
+        /// The argument stays for encoding stability; dropping it belongs in a
+        /// planned breaking release. A swap that pays out elsewhere let a
+        /// delegate (a proxy) send the account's funds to itself, which a
+        /// runtime proxy filter cannot prevent — it never sees the account it
+        /// acts for — and `SwapExecuted` carries no recipient, so such a payout
+        /// was already invisible to anything reading events.
         #[pallet::call_index(3)]
         #[pallet::weight(<T as Config>::WeightInfo::swap_exact_tokens_for_tokens())]
         pub fn swap_exact_tokens_for_tokens(
@@ -1118,6 +1128,7 @@ pub mod pallet {
             recipient: T::AccountId,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            ensure!(recipient == who, Error::<T>::RecipientNotSigner);
             Self::do_swap(
                 &who,
                 asset_in,

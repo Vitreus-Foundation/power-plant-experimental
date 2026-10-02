@@ -279,6 +279,8 @@ impl pallet_launchpad::Config for Test {
     type DescriptionLimit = ConstU32<1024>;
     type DefaultLaunchParams = DefaultLaunchParams;
     type BuyHook = PassHook;
+    // §2.10 free trades are not exercised here; nothing is free.
+    type FreeTradeFee = frame_support::traits::ConstU128<{ u128::MAX }>;
     type WeightInfo = ();
 }
 
