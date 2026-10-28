@@ -10,9 +10,7 @@ use crate::{
     Phase,
 };
 use frame_support::{assert_noop, assert_ok};
-use pallet_vitreus_dex::{
-    LiquidityPositions, PoolInfo, PoolManager, Pools, TotalLiquidity, MINIMUM_LIQUIDITY,
-};
+use pallet_vitreus_dex::{AmmBase, PoolInfo, PoolManager, Pools, MINIMUM_LIQUIDITY};
 use sp_core::U256;
 use sp_runtime::{traits::BadOrigin, DispatchError};
 use std::borrow::Borrow;
@@ -21,6 +19,10 @@ use std::borrow::Borrow;
 
 const SELLABLE: u128 = 800_000_000 * UNIT;
 const RESERVED: u128 = 200_000_000 * UNIT;
+/// What a graduation seeds of the reserved allocation: all but the launch
+/// token's minimum balance (one unit), which the base pallet leaves with the
+/// escrow rather than take its last unit.
+const SEEDED_TOKENS: u128 = RESERVED - 1;
 const RESCUE_DELAY: u64 = 100_800;
 
 fn native() -> NativeOrAssetId {
@@ -39,7 +41,38 @@ fn pair(id: LaunchId) -> (NativeOrAssetId, NativeOrAssetId) {
     VitreusDex::canonical_pair(native(), kind(id))
 }
 fn pool_account(id: LaunchId) -> Acc {
-    VitreusDex::pool_account_for(native(), kind(id))
+    VitreusDex::pool_account_for(native(), kind(id)).unwrap()
+}
+
+// Until the graduation tests are ported to LP tokens, where they read the
+// old pool record and share positions.
+
+/// A graduated pool's reserves from the base pallet: `reserve_a` native,
+/// `reserve_b` the launch token.
+struct Reserves {
+    reserve_a: u128,
+    reserve_b: u128,
+}
+fn pool_of(id: LaunchId) -> Reserves {
+    let (reserve_a, reserve_b) =
+        <VitreusDex as PoolManager<Acc, NativeOrAssetId, u128, u64>>::native_reserves(kind(id))
+            .expect("a pool with liquidity");
+    Reserves { reserve_a, reserve_b }
+}
+/// `who`'s LP tokens in a launch's pool, and the lock on them.
+struct Position {
+    shares: u128,
+    locked_until: Option<u64>,
+}
+fn position(who: &Acc, id: LaunchId) -> Option<Position> {
+    let shares = <Test as pallet_vitreus_dex::Config>::Base::lp_balance(&native(), &kind(id), who);
+    (shares > 0).then_some(Position {
+        shares,
+        locked_until: pallet_vitreus_dex::LiquidityLocks::<Test>::get(pair(id), who),
+    })
+}
+fn lp_issuance(id: LaunchId) -> u128 {
+    <Test as pallet_vitreus_dex::Config>::Base::lp_issuance(&native(), &kind(id))
 }
 fn bv(s: &[u8]) -> frame_support::BoundedVec<u8, frame_support::traits::ConstU32<50>> {
     s.to_vec().try_into().unwrap()
@@ -137,6 +170,16 @@ impl Rng {
     }
 }
 
+/// Buys and sells on launch `id` so far, from its events (never reset in
+/// these tests).
+fn trades(id: LaunchId) -> (u128, u128) {
+    System::events().iter().fold((0, 0), |(b, s), r| match &r.event {
+        RuntimeEvent::Launchpad(Event::Bought { launch_id, .. }) if *launch_id == id => (b + 1, s),
+        RuntimeEvent::Launchpad(Event::Sold { launch_id, .. }) if *launch_id == id => (b, s + 1),
+        _ => (b, s),
+    })
+}
+
 /// I1, I2, I3 (over the given holders), I5, I6 — the storage-level invariants.
 fn check_invariants(id: LaunchId, holders: &[Acc]) {
     let s = state(id);
@@ -170,9 +213,25 @@ fn check_invariants(id: LaunchId, holders: &[Acc]) {
             assert!(s.lp_shares > 0, "I6 lp_shares");
         },
     }
-    // I5
+    // The raise stays within what selling out costs. `raise_at_sellout`
+    // prices that at the curve's original k; every trade rounds in the
+    // curve's favour and leaves k a little higher, and the buy that sells out
+    // is priced at the k it finds, so a sold-out curve can hold a few wei more.
+    // Each buy's rounding moves the sell-out price by under one wei. Each
+    // sell keeps under one wei more quote at a token reserve of at most V_t,
+    // which at sell-out (reserve token_floor) is worth under V_t / token_floor
+    // wei. Anything above that is not rounding.
     let q_max = curve::raise_at_sellout(&t, SELLABLE).unwrap();
-    assert!(s.real_quote <= q_max, "I5 real_quote {} > {}", s.real_quote, q_max);
+    let (buys, sells) = trades(id);
+    let per_sell = (t.token_floor + SELLABLE).div_ceil(t.token_floor);
+    let rounding = buys + sells * per_sell;
+    assert!(
+        s.real_quote <= q_max + rounding,
+        "I5 real_quote {} > {} + {} ({buys} buys, {sells} sells)",
+        s.real_quote,
+        q_max,
+        rounding
+    );
     assert!(s.tokens_remaining <= SELLABLE, "I5 tokens_remaining");
 }
 
@@ -198,11 +257,13 @@ fn lifecycle_happy_path() {
         let l = launch(id);
         assert_eq!(l.asset_id, asset_of(id));
         assert_eq!(Assets::total_supply(asset_of(id)), 1_000_000_000 * UNIT);
-        // creation fee: ED kept free, metadata deposits reserved, the rest to treasury;
-        // the initial buy then adds its net + creator fee to the escrow
+        // creation fee: ED kept free, one more ED set aside for the pool account,
+        // metadata deposits reserved, the rest to treasury; the initial buy then
+        // adds its net + creator fee to the escrow
         let s0 = state(id);
-        assert_eq!(vtrs(&l.escrow), ED + s0.real_quote + s0.creator_fees_unclaimed);
-        assert_eq!(Balances::reserved_balance(&l.escrow), 100 + 2 * 4 + 2 * 4);
+        assert_eq!(vtrs(&l.escrow), 2 * ED + s0.real_quote + s0.creator_fees_unclaimed);
+        // + the deposit for the pool address's launch-token account
+        assert_eq!(Balances::reserved_balance(&l.escrow), 100 + 2 * 4 + 2 * 4 + 10);
         assert!(tok(id, ALICE) > 0);
 
         let buyers = [BOB, CHARLIE, DAVE];
@@ -226,9 +287,9 @@ fn lifecycle_happy_path() {
         assert!(s.protocol_fees_paid > protocol_paid_before);
 
         // I7: pool opens at the curve's final price within 1e-6.
-        let pool = Pools::<Test>::get(pair(id)).unwrap();
+        let pool = pool_of(id);
         let (quote_seeded, tokens_seeded) = (pool.reserve_a, pool.reserve_b); // canonical: Native first
-        assert_eq!(tokens_seeded, RESERVED);
+        assert_eq!(tokens_seeded, SEEDED_TOKENS);
         let (pn, pd) = p_end(id);
         // |quote/tokens − pn/pd| / (pn/pd) ≤ 1e-6  ⇔  |quote·pd − tokens·pn| · 1e6 ≤ tokens·pn
         let lhs = U256::from(quote_seeded) * U256::from(pd);
@@ -239,21 +300,20 @@ fn lifecycle_happy_path() {
         let t = T_DEFAULT;
         assert!(
             quote_seeded <= t && t - quote_seeded <= t / 100_000_000,
-            "raise {} vs T {}",
-            quote_seeded,
-            t
+            "raise {quote_seeded} vs T {t}"
         );
 
         // Position: escrow, locked forever.
-        let pos = LiquidityPositions::<Test>::get(&l.escrow, pair(id)).unwrap();
+        let pos = position(&l.escrow, id).unwrap();
         assert_eq!(pos.locked_until, Some(u64::MAX));
         assert_eq!(pos.shares, s.lp_shares);
 
-        // Treasury got creation-fee surplus + protocol fees.
+        // Treasury got creation-fee surplus + protocol fees, and at
+        // graduation the ED creation set aside for the pool account.
         let s = state(id);
         assert_eq!(
             vtrs(TREASURY) - treasury_before,
-            s.protocol_fees_paid + (CREATION_FEE - ED - (100 + 2 * 4 + 2 * 4))
+            s.protocol_fees_paid + (CREATION_FEE - ED - (100 + 2 * 4 + 2 * 4 + 10))
         );
         assert!(has_event(|e| matches!(e, Event::Graduated { .. })));
     });
@@ -276,6 +336,44 @@ fn lifecycle_initial_buy_completes_curve() {
         assert_eq!(state(id).phase, Phase::Graduated);
         assert_eq!(tok(id, ALICE), SELLABLE);
         assert!(VitreusDex::pool_exists(native(), kind(id)));
+    });
+}
+
+/// The raise check allows what rounding can explain and no more: a raise exactly
+/// at `raise_at_sellout` plus that allowance holds, one wei past it does not.
+#[test]
+fn raise_check_tells_rounding_from_raise_too_large() {
+    new_test_ext().execute_with(|| {
+        let id = create(ALICE);
+        buy(BOB, id, 100 * UNIT);
+        sell(BOB, id, tok(id, BOB) / 2);
+        buy(CHARLIE, id, 50 * UNIT);
+        check_invariants(id, &[ALICE, BOB, CHARLIE]);
+
+        let t = terms(id);
+        let (buys, sells) = trades(id);
+        assert_eq!((buys, sells), (2, 1), "two buys and a sell");
+        let per_sell = (t.token_floor + SELLABLE).div_ceil(t.token_floor);
+        let allowed = curve::raise_at_sellout(&t, SELLABLE).unwrap() + buys + sells * per_sell;
+        // Give the escrow what such a raise would hold, so only the raise is in question.
+        assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), escrow(id), 2 * allowed));
+        let set_raise =
+            |q: u128| Curves::<Test>::mutate(id, |c| c.as_mut().unwrap().real_quote = q);
+
+        set_raise(allowed);
+        check_invariants(id, &[ALICE, BOB, CHARLIE]);
+
+        set_raise(allowed + 1);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_invariants(id, &[ALICE, BOB, CHARLIE])
+        }))
+        .expect_err("one wei past the allowance must trip the raise check");
+        let message = failed
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| failed.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(message.starts_with("I5 real_quote"), "{message}");
     });
 }
 
@@ -364,15 +462,11 @@ fn fm01_seed_into_existing_liquid_pool_is_rejected() {
         Pools::<Test>::insert(
             pair(id),
             PoolInfo {
-                reserve_a: 0,
-                reserve_b: 0,
                 fee_tier: 3,
                 total_fees_collected: 0,
                 routing: pallet_vitreus_dex::FeeRouting::default(),
-                pool_account: pool_account(id),
             },
         );
-        TotalLiquidity::<Test>::insert(pair(id), 0u128);
         assert_ok!(VitreusDex::do_add_liquidity_for(
             &BOB,
             native(),
@@ -428,20 +522,26 @@ fn fm02_prefunded_pool_account_does_not_move_opening_price() {
 
         cross(CHARLIE, id);
         assert_eq!(state(id).phase, Phase::Graduated);
-        let pool = Pools::<Test>::get(pair(id)).unwrap();
+        let pool = pool_of(id);
         let raised = pool.reserve_a;
-        assert_eq!(pool.reserve_b, RESERVED);
-        // Live balances equal the stored amounts: nothing extra in the pool.
+        assert_eq!(pool.reserve_b, SEEDED_TOKENS);
+        // Nothing in the pool but the seed: the base pool keeps nothing of
+        // its own, so its whole balance is the reserve.
         assert_eq!(vtrs(&pa), raised);
-        assert_eq!(tok(id, &pa), RESERVED);
-        // Donations went to the DEX excess recipient.
+        assert_eq!(tok(id, &pa), SEEDED_TOKENS);
+        // The native donation went to the DEX excess recipient, all of it;
+        // the token donation was burned.
         assert_eq!(vtrs(EXCESS) - excess_before.0, 5 * UNIT);
-        assert_eq!(tok(id, EXCESS) - excess_before.1, donated_tokens);
-        // First swap prices off the stored reserves (sync_reserves finds nothing extra).
+        assert_eq!(tok(id, EXCESS) - excess_before.1, 0);
+        assert_eq!(Assets::total_supply(asset_of(id)), 1_000_000_000 * UNIT - donated_tokens);
+        // The first swap prices off the seed alone: what the tier leaves of
+        // the input against the seeded reserves, within the part per million
+        // the routed slices and the pool fee's rounding cost (a donation
+        // counted in would move it by about a thousand times that).
         let amount_in = 10 * UNIT;
         let after_fee = amount_in - amount_in * 3 / 1_000;
         let expected = u128::try_from(
-            U256::from(RESERVED) * U256::from(after_fee) / U256::from(raised + after_fee),
+            U256::from(SEEDED_TOKENS) * U256::from(after_fee) / U256::from(raised + after_fee),
         )
         .unwrap();
         let before = tok(id, DAVE);
@@ -450,10 +550,11 @@ fn fm02_prefunded_pool_account_does_not_move_opening_price() {
             native(),
             kind(id),
             amount_in,
-            expected,
+            1,
             DAVE
         ));
-        assert_eq!(tok(id, DAVE) - before, expected);
+        let got = tok(id, DAVE) - before;
+        assert!(got.abs_diff(expected) <= expected / 1_000_000, "{got} vs {expected}");
     });
 }
 
@@ -603,7 +704,7 @@ fn fm04_donation_to_escrow_is_inert() {
         // I2 holds as ≥: escrow tokens = tracked + reserved + donation
         assert_eq!(tok(id, escrow(id)), s_before.tokens_remaining + RESERVED + donated_tokens);
         cross(DAVE, id);
-        let pool = Pools::<Test>::get(pair(id)).unwrap();
+        let pool = pool_of(id);
         assert_eq!(pool.reserve_b, RESERVED);
         // Donations never entered the pool: they are still in escrow.
         assert!(vtrs(escrow(id)) >= 100 * UNIT + ED + state(id).creator_fees_unclaimed);
@@ -744,7 +845,6 @@ fn fm06_no_creator_lp_and_position_is_permanent() {
         let id = create(ALICE);
         cross(BOB, id);
         let e = escrow(id);
-        let p = pair(id);
         assert_noop!(
             VitreusDex::remove_liquidity(origin(ALICE), native(), kind(id), 1, 0, 0),
             pallet_vitreus_dex::Error::<Test>::InsufficientShares
@@ -763,11 +863,8 @@ fn fm06_no_creator_lp_and_position_is_permanent() {
             ),
             pallet_vitreus_dex::Error::<Test>::LockCannotBeShortened
         );
-        let positions: Vec<_> =
-            LiquidityPositions::<Test>::iter().filter(|(_, pp, _)| *pp == p).collect();
-        assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].0, e);
-        assert_eq!(positions[0].2.locked_until, Some(u64::MAX));
+        assert_eq!(lp_issuance(id), position(&e, id).unwrap().shares + MINIMUM_LIQUIDITY as u128);
+        assert_eq!(position(&e, id).unwrap().locked_until, Some(u64::MAX));
         System::set_block_number(u64::MAX - 1);
         assert_noop!(
             VitreusDex::remove_liquidity(origin(&e), native(), kind(id), 1, 0, 0),
@@ -780,21 +877,26 @@ fn fm06_no_creator_lp_and_position_is_permanent() {
 // FM-08 — crossing buy, partial fill, deferred seed
 // =======================================================================
 
-/// Make the next seed fail: drain the DEX excess recipient so a pre-seed token
-/// donation at the pool address cannot be delivered (ExcessRecipientCannotReceive).
-fn arm_seed_failure(id: LaunchId, donor: impl Borrow<Acc>) {
-    let donor = donor.borrow();
-    assert_ok!(Balances::transfer_allow_death(origin(donor), pool_account(id), UNIT));
-    assert_ok!(Assets::transfer(
-        origin(donor),
-        asset_of(id).into(),
-        pool_account(id),
-        1_000 * UNIT
-    ));
-    assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), EXCESS, 0));
+/// Make the next seed of launch `id` fail, as a chain can: governance has
+/// not configured a fee split for the launch's pool tier, so the seed
+/// is refused rather than graduating a pool that routes nothing to its
+/// treasury. The launch defers its graduation; `disarm_seed_failure` is
+/// governance setting the tier, after which anyone can retry.
+fn arm_seed_failure(id: LaunchId) {
+    pallet_vitreus_dex::DefaultFeeRouting::<Test>::remove(launch(id).curve.pool_fee_tier);
 }
-fn disarm_seed_failure() {
-    assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), EXCESS, ED));
+fn disarm_seed_failure(id: LaunchId) {
+    assert_ok!(VitreusDex::set_default_fee_routing(
+        RuntimeOrigin::root(),
+        launch(id).curve.pool_fee_tier,
+        0,
+        0,
+        0
+    ));
+}
+/// The error a seed armed to fail defers with.
+fn armed_error() -> DispatchError {
+    dex_err(pallet_vitreus_dex::Error::<Test>::NoDefaultFeeRouting)
 }
 
 #[test]
@@ -823,7 +925,7 @@ fn fm08_crossing_buy_partial_fill_and_deferred_seed() {
             "remaining {remaining}"
         );
 
-        arm_seed_failure(id, BOB);
+        arm_seed_failure(id);
         let quote = Launchpad::quote_buy(id, 3 * q_to_leave_1m).unwrap();
         assert!(quote.crossed);
         let before = vtrs(DAVE);
@@ -840,27 +942,21 @@ fn fm08_crossing_buy_partial_fill_and_deferred_seed() {
         assert_eq!(s.phase, Phase::Complete);
         assert_eq!(s.tokens_remaining, 0);
         assert!(s.real_quote > 0);
-        assert_eq!(
-            deferred_error(),
-            Some(dex_err(pallet_vitreus_dex::Error::<Test>::ExcessRecipientCannotReceive))
-        );
+        assert_eq!(deferred_error(), Some(armed_error()));
         assert!(!VitreusDex::pool_exists(native(), kind(id)));
         assert_noop!(Launchpad::sell(origin(DAVE), id, 1, 0), Error::<Test>::WrongPhase);
         assert_noop!(Launchpad::buy(origin(DAVE), id, UNIT, 0), Error::<Test>::WrongPhase);
-        assert_noop!(
-            Launchpad::graduate(origin(CHARLIE), id),
-            dex_err(pallet_vitreus_dex::Error::<Test>::ExcessRecipientCannotReceive)
-        );
+        assert_noop!(Launchpad::graduate(origin(CHARLIE), id), armed_error());
 
         // unforce → anyone graduates; the pool holds exactly the stored amounts
-        disarm_seed_failure();
+        disarm_seed_failure(id);
         let raised = state(id).real_quote;
         assert_ok!(Launchpad::graduate(origin(CHARLIE), id));
         assert_eq!(state(id).phase, Phase::Graduated);
-        let pool = Pools::<Test>::get(pair(id)).unwrap();
-        assert_eq!((pool.reserve_a, pool.reserve_b), (raised, RESERVED));
+        let pool = pool_of(id);
+        assert_eq!((pool.reserve_a, pool.reserve_b), (raised, SEEDED_TOKENS));
         assert_eq!(vtrs(pool_account(id)), raised);
-        assert_eq!(tok(id, pool_account(id)), RESERVED);
+        assert_eq!(tok(id, pool_account(id)), SEEDED_TOKENS);
     });
 }
 
@@ -1080,7 +1176,7 @@ fn fm10_params_change_does_not_touch_live_launch() {
         assert_eq!(state(l).creator_fees_unclaimed, UNIT / 200);
         // L graduates at ≈ 30 VTRS
         cross(BOB, l);
-        let raised = Pools::<Test>::get(pair(l)).unwrap().reserve_a;
+        let raised = pool_of(l).reserve_a;
         assert!(raised <= 30 * UNIT && 30 * UNIT - raised < UNIT / 1_000_000);
 
         // M uses the new terms
@@ -1194,10 +1290,10 @@ fn fm11_seed_overflow_is_impossible() {
         assert_ok!(Launchpad::buy(origin(ALICE), id, 5_000_000_000 * UNIT, 0));
         // pre-D1 the DEX's first deposit (isqrt(3e27 × 2e26)) overflowed u128
         assert_eq!(state(id).phase, Phase::Graduated);
-        let pool = Pools::<Test>::get(pair(id)).unwrap();
+        let pool = pool_of(id);
         assert!(pool.reserve_a > 2_999_000_000 * UNIT);
-        assert_eq!(pool.reserve_b, RESERVED);
-        assert!(TotalLiquidity::<Test>::get(pair(id)).unwrap() > u128::from(MINIMUM_LIQUIDITY));
+        assert_eq!(pool.reserve_b, SEEDED_TOKENS);
+        assert!(lp_issuance(id) > u128::from(MINIMUM_LIQUIDITY));
     });
 }
 
@@ -1210,15 +1306,11 @@ fn fm11_every_complete_state_has_a_forward_path() {
         Pools::<Test>::insert(
             pair(id),
             PoolInfo {
-                reserve_a: 0,
-                reserve_b: 0,
                 fee_tier: 3,
                 total_fees_collected: 0,
                 routing: pallet_vitreus_dex::FeeRouting::default(),
-                pool_account: pool_account(id),
             },
         );
-        TotalLiquidity::<Test>::insert(pair(id), 0u128);
         // liquidity at roughly p_end so the rescue is within tolerance
         let (pn, pd) = p_end(id);
         let tokens = tok(id, BOB);
@@ -1234,14 +1326,15 @@ fn fm11_every_complete_state_has_a_forward_path() {
         let s = state(id);
         assert_eq!(s.phase, Phase::Graduated);
         assert!(s.lp_shares > 0);
-        // funds left escrow only to the pool or the treasury
-        assert_eq!(vtrs(&e), ED + s.creator_fees_unclaimed);
+        // funds left escrow only to the pool or the treasury; the ED set
+        // aside for a new pool account stays, since this pool had its own
+        assert_eq!(vtrs(&e), 2 * ED + s.creator_fees_unclaimed);
         assert_eq!(tok(id, &e), 0);
-        let pool = Pools::<Test>::get(pair(id)).unwrap();
+        let pool = pool_of(id);
         let to_pool_q = pool.reserve_a - quote;
         let to_treasury_q = vtrs(TREASURY) - treasury_before;
         assert_eq!(to_pool_q + to_treasury_q, raised);
-        let pos = LiquidityPositions::<Test>::get(&e, pair(id)).unwrap();
+        let pos = position(&e, id).unwrap();
         assert_eq!(pos.locked_until, Some(u64::MAX));
     });
     // (b) pool record exists with ZERO liquidity → the crossing buy adopts it
@@ -1250,31 +1343,25 @@ fn fm11_every_complete_state_has_a_forward_path() {
         Pools::<Test>::insert(
             pair(id),
             PoolInfo {
-                reserve_a: 0,
-                reserve_b: 0,
                 fee_tier: 3,
                 total_fees_collected: 0,
                 routing: pallet_vitreus_dex::FeeRouting::default(),
-                pool_account: pool_account(id),
             },
         );
-        TotalLiquidity::<Test>::insert(pair(id), 0u128);
         cross(BOB, id);
         assert_eq!(state(id).phase, Phase::Graduated);
-        assert_eq!(Pools::<Test>::get(pair(id)).unwrap().reserve_b, RESERVED);
+        assert_eq!(pool_of(id).reserve_b, SEEDED_TOKENS);
     });
-    // (c) excess recipient cannot receive → deferred, fixed, permissionless retry
+    // (c) the seed is refused (no fee split for the tier) → deferred, fixed,
+    // permissionless retry
     new_test_ext().execute_with(|| {
         let id = create(ALICE);
         buy(BOB, id, 10 * UNIT);
-        arm_seed_failure(id, BOB);
+        arm_seed_failure(id);
         cross(CHARLIE, id);
         assert_eq!(state(id).phase, Phase::Complete);
-        assert_noop!(
-            Launchpad::graduate(origin(DAVE), id),
-            dex_err(pallet_vitreus_dex::Error::<Test>::ExcessRecipientCannotReceive)
-        );
-        disarm_seed_failure();
+        assert_noop!(Launchpad::graduate(origin(DAVE), id), armed_error());
+        disarm_seed_failure(id);
         assert_ok!(Launchpad::graduate(origin(DAVE), id));
         assert_eq!(state(id).phase, Phase::Graduated);
     });
@@ -1350,7 +1437,7 @@ fn fm13_dump_model_exposes_concentration() {
             buy(CHARLIE, id, 50 * UNIT);
         }
         cross(BOB, id);
-        let pool = Pools::<Test>::get(pair(id)).unwrap();
+        let pool = pool_of(id);
         let (rq, rt) = (pool.reserve_a, pool.reserve_b);
         let held = tok(id, CHARLIE);
         // constant-product prediction with the pool's 0.3 % fee
@@ -1471,7 +1558,9 @@ fn fm15_escrow_survives_full_sellback_and_claims() {
             assert_ok!(Launchpad::claim_creator_fees(origin(ALICE), id));
             assert!(frame_system::Pallet::<Test>::account_exists(&e));
             assert!(vtrs(&e) >= ED);
-            assert_eq!(Balances::reserved_balance(&e), 100 + 2 * 4 + 2 * 4); // metadata base + per-byte; Create::create reserves no AssetDeposit
+            // metadata base + per-byte, and the pool address's launch-token
+            // account; Create::create reserves no AssetDeposit
+            assert_eq!(Balances::reserved_balance(&e), 100 + 2 * 4 + 2 * 4 + 10);
             assert_eq!(tok(id, &e), 1_000_000_000 * UNIT);
             buy(DAVE, id, UNIT);
             assert!(tok(id, DAVE) > 0);
@@ -1555,7 +1644,7 @@ fn weights_crossing_buy_refunds_when_not_crossing() {
         // Pre-dispatch, `buy` is always charged the crossing path.
         let call: RuntimeCall =
             crate::Call::<Test>::buy { launch_id: id, quote_in: 1, min_tokens_out: 0 }.into();
-        assert_eq!(call.get_dispatch_info().weight, <() as W>::buy_crossing());
+        assert_eq!(call.get_dispatch_info().call_weight, <() as W>::buy_crossing());
         assert!(<() as W>::buy_crossing().all_gt(<() as W>::buy()));
 
         // A buy that leaves tokens on the curve refunds down to `buy()`.
@@ -1580,7 +1669,7 @@ fn weights_crossing_buy_refunds_when_not_crossing() {
         }
         .into();
         assert_eq!(
-            call.get_dispatch_info().weight,
+            call.get_dispatch_info().call_weight,
             <() as W>::create_launch(4, 4, 0, 0).saturating_add(<() as W>::buy_crossing())
         );
         let post = Launchpad::create_launch(
@@ -1610,7 +1699,7 @@ fn weights_crossing_buy_refunds_when_not_crossing() {
             metadata: None,
         }
         .into();
-        assert_eq!(call.get_dispatch_info().weight, <() as W>::create_launch(4, 4, 0, 0));
+        assert_eq!(call.get_dispatch_info().call_weight, <() as W>::create_launch(4, 4, 0, 0));
         let post = Launchpad::create_launch(
             origin(CHARLIE),
             bv(b"Meme"),

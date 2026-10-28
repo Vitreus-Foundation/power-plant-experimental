@@ -33,6 +33,8 @@ pub use pallet::*;
 pub mod weights;
 pub use weights::WeightInfo;
 
+#[cfg(test)]
+mod account_lifecycle_tests;
 #[cfg(feature = "runtime-benchmarks")]
 pub mod benchmarking;
 #[cfg(test)]
@@ -62,7 +64,7 @@ use frame_support::{
 use frame_system::pallet_prelude::BlockNumberFor;
 use pallet_launchpad::{AssetIdOf, AssetKindOf, BalanceOf, CurveVenue, Phase};
 use pallet_vitreus_dex::{PoolManager, TreasurySink, BPS};
-use parity_scale_codec::{Decode, Encode, MaxEncodedLen};
+use parity_scale_codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use scale_info::TypeInfo;
 use sp_core::U256;
 use sp_runtime::{
@@ -137,7 +139,17 @@ pub trait TreasuryExchange<AccountId, Balance> {
 /// snapshotted into each treasury when it is first funded. The fee slices
 /// themselves live where they are snapshotted: the DEX's `DefaultFeeRouting`
 /// (`treasury_bps`) and the launchpad's `Params` (`treasury_share_bps`).
-#[derive(Clone, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[derive(
+    Clone,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    Eq,
+    PartialEq,
+    RuntimeDebug,
+    TypeInfo,
+    MaxEncodedLen,
+)]
 pub struct TreasuryTerms<Balance, BlockNumber> {
     /// Blocks without a trade on the venue after which `retire` is allowed.
     pub dormancy_blocks: BlockNumber,
@@ -151,7 +163,18 @@ pub struct TreasuryTerms<Balance, BlockNumber> {
     pub keeper_bounty_bps: u16,
 }
 
-#[derive(Clone, Copy, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[derive(
+    Clone,
+    Copy,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    Eq,
+    PartialEq,
+    RuntimeDebug,
+    TypeInfo,
+    MaxEncodedLen,
+)]
 pub enum TreasuryStatus {
     Active,
     /// Shares redeemed and unbonded; the chunk matures at `chunk_era`.
@@ -163,7 +186,17 @@ pub enum TreasuryStatus {
 }
 
 /// Per-launch state (spec §5.2).
-#[derive(Clone, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[derive(
+    Clone,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    Eq,
+    PartialEq,
+    RuntimeDebug,
+    TypeInfo,
+    MaxEncodedLen,
+)]
 pub struct TreasuryRecord<Balance, BlockNumber> {
     /// VTRS received from fees, free in the vault, not yet bonded.
     pub pending: Balance,
@@ -200,8 +233,6 @@ pub mod pallet {
     /// `pallet_launchpad::Pallet<T>` through [`CurveVenue`].
     #[pallet::config]
     pub trait Config: frame_system::Config + pallet_launchpad::Config {
-        type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
-
         /// `set_terms`, `set_targets`.
         type TreasuryManageOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 
@@ -791,6 +822,13 @@ pub mod pallet {
             if !t.pending_burn.is_zero()
                 && now.saturating_sub(t.last_burn_block) >= terms.min_burn_interval
             {
+                // The slice buys the launch token into the vault, one account
+                // for every launch: where its consumer references are used up
+                // the token's account there is opened on the caller's
+                // deposit, so a full vault cannot stop the burn.
+                if let Some(asset) = Self::asset_kind_of(launch_id) {
+                    pallet_vitreus_dex::Pallet::<T>::open_for_credit(asset, &vault, caller)?;
+                }
                 let before = Self::assets_balance(Self::native(), &vault);
                 let pending_before = t.pending;
                 if let Some(tokens) =

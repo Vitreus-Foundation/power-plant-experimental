@@ -20,7 +20,8 @@ use std::cell::RefCell;
 type Block = frame_system::mocking::MockBlock<Test>;
 
 pub const UNIT: u128 = 1_000_000_000_000_000_000;
-pub const ED: u128 = 1_000_000_000_000; // 10^-6 VTRS
+/// The runtime's existential deposit, 100 µVTRS.
+pub const ED: u128 = 100_000_000_000_000;
 
 /// 32-byte account ids: PalletId sub-accounts must not truncate to a shared
 /// prefix ("modl" + "vtrs…" would make every escrow and pool account collide
@@ -49,6 +50,9 @@ construct_runtime!(
         Balances: pallet_balances,
         Assets: pallet_assets,
         VitreusDex: pallet_vitreus_dex,
+        AssetConversion: pallet_asset_conversion,
+        PoolAssets: pallet_assets::<Instance2>,
+        PoolAssetsFreezer: pallet_assets_freezer::<Instance2>,
         Utility: pallet_utility,
         Proxy: pallet_proxy,
         Multisig: pallet_multisig,
@@ -67,6 +71,8 @@ impl frame_system::Config for Test {
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Test {
     type Balance = u128;
+    // The DEX freezes LP tokens; balances shares the runtime's freeze reasons.
+    type MaxFreezes = frame_support::traits::VariantCountOf<RuntimeFreezeReason>;
     type ExistentialDeposit = ConstU128<ED>;
     type AccountStore = System;
 }
@@ -79,6 +85,8 @@ parameter_types! {
 
 impl pallet_assets::Config for Test {
     type RuntimeEvent = RuntimeEvent;
+    type Holder = ();
+    type ReserveData = ();
     type Balance = u128;
     type RemoveItemsLimit = ConstU32<1000>;
     type AssetId = u128;
@@ -107,10 +115,11 @@ impl pallet_assets::Config for Test {
 // unification can switch it on from a sibling crate in the same `cargo test`).
 pallet_assets::runtime_benchmarks_enabled! {
     pub struct AssetsBenchmarkHelper;
-    impl pallet_assets::BenchmarkHelper<parity_scale_codec::Compact<u128>> for AssetsBenchmarkHelper {
+    impl pallet_assets::BenchmarkHelper<parity_scale_codec::Compact<u128>, ()> for AssetsBenchmarkHelper {
         fn create_asset_id_parameter(id: u32) -> parity_scale_codec::Compact<u128> {
             parity_scale_codec::Compact(id.into())
         }
+        fn create_reserve_id_parameter(_: u32) {}
     }
 }
 
@@ -172,8 +181,9 @@ impl pallet_vitreus_dex::CreatorFeeRecipient<NativeOrAssetId, Acc> for Launchpad
     }
 }
 
+pallet_vitreus_dex::impl_base_pallet_for_mock!(Test, Acc, u128, NativeAndAssets, NativeAsset);
+
 impl pallet_vitreus_dex::Config for Test {
-    type RuntimeEvent = RuntimeEvent;
     type ManageOrigin = EnsureRoot<Acc>;
     type Balance = u128;
     type HigherPrecisionBalance = sp_core::U256;
@@ -186,9 +196,8 @@ impl pallet_vitreus_dex::Config for Test {
     type DefaultProtocolFeeRecipient = TreasuryAccount;
     type CreatorFeeRecipient = LaunchpadCreators;
     type TreasurySink = ();
-    type DefaultBidWindowBlocks = ConstU64<10>;
-    type DefaultSettlementWindowBlocks = ConstU64<5>;
-    type DefaultSolverBondAmount = ConstU128<1_000_000_000_000>;
+    type Base = pallet_vitreus_dex::AssetConversionAdapter<Self, PoolAssetsFreezer>;
+    type RuntimeFreezeReason = RuntimeFreezeReason;
     type WeightInfo = ();
     #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = ();
@@ -210,6 +219,7 @@ impl pallet_utility::Config for Test {
     PartialOrd,
     Encode,
     Decode,
+    DecodeWithMemTracking,
     RuntimeDebug,
     MaxEncodedLen,
     TypeInfo,
@@ -227,6 +237,7 @@ impl InstanceFilter<RuntimeCall> for ProxyType {
 
 impl pallet_proxy::Config for Test {
     type RuntimeEvent = RuntimeEvent;
+    type BlockNumberProvider = frame_system::Pallet<Test>;
     type RuntimeCall = RuntimeCall;
     type Currency = Balances;
     type ProxyType = ProxyType;
@@ -242,6 +253,7 @@ impl pallet_proxy::Config for Test {
 
 impl pallet_multisig::Config for Test {
     type RuntimeEvent = RuntimeEvent;
+    type BlockNumberProvider = frame_system::Pallet<Test>;
     type RuntimeCall = RuntimeCall;
     type Currency = Balances;
     type DepositBase = ConstU128<ED>;
@@ -260,7 +272,9 @@ parameter_types! {
     pub const LaunchAssetBase: u128 = ASSET_BASE;
     pub const MinGraduationTarget: u128 = 3 * UNIT;
     pub const MaxGraduationTarget: u128 = 3_000_000_000 * UNIT;
-    pub const MinCreationFee: u128 = 2 * ED + 100 + 100 + 2 * 50 * 2; // 2·ED + AssetDeposit + MetadataDepositBase + 2·StringLimit·PerByte
+    // 2·ED + AssetDeposit + MetadataDepositBase + 2·StringLimit·PerByte +
+    // AssetAccountDeposit (the pool address's launch-token account)
+    pub const MinCreationFee: u128 = 2 * ED + 100 + 100 + 2 * 50 * 2 + 10;
     pub const TreasuryAccount: Acc = TREASURY;
     pub DefaultLaunchParams: LaunchParams<u128> = LaunchParams {
         graduation_target: T_DEFAULT,
@@ -339,7 +353,6 @@ impl OnCurveBuy<Acc, u128, u64> for RecordingHook {
 }
 
 impl pallet_launchpad::Config for Test {
-    type RuntimeEvent = RuntimeEvent;
     type LaunchManageOrigin = EnsureRoot<Acc>;
     type AssetId = u128;
     type Currency = Balances;
@@ -375,6 +388,7 @@ pub const RICH: u128 = 1_000_000_000 * UNIT;
 pub fn new_test_ext() -> sp_io::TestExternalities {
     let mut t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
     pallet_balances::GenesisConfig::<Test> {
+        dev_accounts: None,
         balances: vec![
             (ALICE, RICH),
             (BOB, RICH),

@@ -5,23 +5,14 @@ use crate as pallet_vitreus_dex;
 
 use frame_support::{
     construct_runtime, derive_impl, parameter_types,
-    traits::{AsEnsureOriginWithArg, ConstU128, ConstU32, ConstU64},
+    traits::{AsEnsureOriginWithArg, ConstU128, ConstU32},
 };
 use frame_system::{EnsureRoot, EnsureSigned};
 use sp_runtime::{traits::IdentityLookup, BuildStorage};
 
 type Block = frame_system::mocking::MockBlock<Test>;
 
-pub const ALICE: u128 = 1;
-pub const BOB: u128 = 2;
-pub const CHARLIE: u128 = 3;
-
-pub const USDC_ID: u32 = 1;
-pub const VNRG_ID: u32 = 2;
-/// Account that receives pre-seed sweeps (stands in for the treasury).
-pub const TREASURY: u128 = 99;
-/// Asset ids at or above this are "reserved" in the mock (launchpad range).
-pub const RESERVED_ASSET_BASE: u32 = 1_000;
+pub use crate::testing::*;
 
 construct_runtime!(
     pub enum Test
@@ -30,12 +21,15 @@ construct_runtime!(
         Balances: pallet_balances,
         Assets: pallet_assets,
         VitreusDex: pallet_vitreus_dex,
+        AssetConversion: pallet_asset_conversion,
+        PoolAssets: pallet_assets::<Instance2>,
+        PoolAssetsFreezer: pallet_assets_freezer::<Instance2>,
     }
 );
 
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
-    type AccountId = u128;
+    type AccountId = sp_core::H160;
     type Lookup = IdentityLookup<Self::AccountId>;
     type Block = Block;
     type AccountData = pallet_balances::AccountData<u128>;
@@ -44,12 +38,16 @@ impl frame_system::Config for Test {
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Test {
     type Balance = u128;
-    type ExistentialDeposit = ConstU128<1>;
+    // The DEX freezes LP tokens; balances shares the runtime's freeze reasons.
+    type MaxFreezes = frame_support::traits::VariantCountOf<RuntimeFreezeReason>;
+    type ExistentialDeposit = ExistentialDeposit;
     type AccountStore = System;
 }
 
 impl pallet_assets::Config for Test {
     type RuntimeEvent = RuntimeEvent;
+    type Holder = ();
+    type ReserveData = ();
     type Balance = u128;
     type RemoveItemsLimit = ConstU32<1000>;
     type AssetId = u32;
@@ -57,8 +55,8 @@ impl pallet_assets::Config for Test {
     type Currency = Balances;
     type CreateOrigin = AsEnsureOriginWithArg<EnsureSigned<Self::AccountId>>;
     type ForceOrigin = EnsureRoot<Self::AccountId>;
-    type AssetDeposit = ConstU128<0>;
-    type AssetAccountDeposit = ConstU128<0>;
+    type AssetDeposit = AssetDeposit;
+    type AssetAccountDeposit = AssetAccountDeposit;
     type MetadataDepositBase = ConstU128<0>;
     type MetadataDepositPerByte = ConstU128<0>;
     type ApprovalDeposit = ConstU128<0>;
@@ -74,30 +72,39 @@ impl pallet_assets::Config for Test {
 
 pub type NativeOrAssetId = frame_support::traits::fungible::NativeOrWithId<u32>;
 
-type NativeAndAssets = frame_support::traits::fungible::UnionOf<
+crate::impl_base_pallet_for_mock!(Test, AccountId, u32, NativeAndAssets, NativeAsset);
+
+pub type NativeAndAssets = frame_support::traits::fungible::UnionOf<
     Balances,
     Assets,
     frame_support::traits::fungible::NativeFromLeft,
     NativeOrAssetId,
-    u128,
+    AccountId,
 >;
+
+parameter_types! {
+    // Per-thread, so each test sees the values its externalities set. The
+    // defaults are the unit-test values the arithmetic tests are written
+    // against; `new_runtime_like_ext` switches to the runtime's.
+    pub static ExistentialDeposit: u128 = 1;
+    pub static AssetDeposit: u128 = 0;
+    pub static AssetAccountDeposit: u128 = 0;
+}
 
 parameter_types! {
     pub const NativeAsset: NativeOrAssetId = NativeOrAssetId::Native;
     pub const USDC: u32 = USDC_ID;
     pub const VNRG: u32 = VNRG_ID;
     pub EnergyAsset: NativeOrAssetId = NativeOrAssetId::WithId(VNRG_ID);
-    pub const ExcessRecipient: u128 = TREASURY;
+    pub const ExcessRecipient: AccountId = TREASURY;
 }
 
 /// D4: the creator on record for a reserved asset in tests (stands in for
 /// the launchpad's `creator_fee_recipient`). `LAUNCH_ID` → `CREATOR`;
 /// everything else has no creator.
-pub const CREATOR: u128 = 77;
-pub const LAUNCH_ID: u32 = RESERVED_ASSET_BASE + 1;
 pub struct MockCreators;
-impl crate::CreatorFeeRecipient<NativeOrAssetId, u128> for MockCreators {
-    fn creator_fee_recipient(asset: &NativeOrAssetId) -> Option<u128> {
+impl crate::CreatorFeeRecipient<NativeOrAssetId, AccountId> for MockCreators {
+    fn creator_fee_recipient(asset: &NativeOrAssetId) -> Option<AccountId> {
         match asset {
             NativeOrAssetId::WithId(id) if *id == LAUNCH_ID => Some(CREATOR),
             NativeOrAssetId::WithId(id) => PRIMED_CREATORS.with(|c| c.borrow().get(id).copied()),
@@ -109,10 +116,9 @@ impl crate::CreatorFeeRecipient<NativeOrAssetId, u128> for MockCreators {
 /// D9: a recording treasury sink. `SINK_VAULT` is the account the launch
 /// asset's treasury slice is pushed to (`None` = no treasury, fold into
 /// protocol); `SINK_NOTED` is every `(asset id, amount)` the DEX reported.
-pub const VAULT: u128 = 88;
 pub struct MockSink;
-impl crate::TreasurySink<NativeOrAssetId, u128, u128> for MockSink {
-    fn account_for(asset: &NativeOrAssetId) -> Option<u128> {
+impl crate::TreasurySink<NativeOrAssetId, AccountId, u128> for MockSink {
+    fn account_for(asset: &NativeOrAssetId) -> Option<AccountId> {
         match asset {
             NativeOrAssetId::WithId(id) if *id == LAUNCH_ID => SINK_VAULT.with(|v| *v.borrow()),
             _ => None,
@@ -126,10 +132,10 @@ impl crate::TreasurySink<NativeOrAssetId, u128, u128> for MockSink {
 }
 
 thread_local! {
-    pub static SINK_VAULT: std::cell::RefCell<Option<u128>> = const { std::cell::RefCell::new(None) };
+    pub static SINK_VAULT: std::cell::RefCell<Option<AccountId>> = const { std::cell::RefCell::new(None) };
     pub static SINK_NOTED: std::cell::RefCell<Vec<(u32, u128)>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Creators primed by `MockBenchHelper::set_creator` (benchmarks only).
-    static PRIMED_CREATORS: std::cell::RefCell<std::collections::BTreeMap<u32, u128>> =
+    static PRIMED_CREATORS: std::cell::RefCell<std::collections::BTreeMap<u32, AccountId>> =
         const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
@@ -138,11 +144,11 @@ thread_local! {
 #[cfg(feature = "runtime-benchmarks")]
 pub struct MockBenchHelper;
 #[cfg(feature = "runtime-benchmarks")]
-impl crate::BenchmarkHelper<NativeOrAssetId, u128> for MockBenchHelper {
+impl crate::BenchmarkHelper<NativeOrAssetId, AccountId> for MockBenchHelper {
     fn asset_kind(seed: u32) -> NativeOrAssetId {
         NativeOrAssetId::WithId(seed)
     }
-    fn set_creator(asset: &NativeOrAssetId, who: &u128) -> bool {
+    fn set_creator(asset: &NativeOrAssetId, who: &AccountId) -> bool {
         match asset {
             NativeOrAssetId::WithId(id) => {
                 PRIMED_CREATORS.with(|c| c.borrow_mut().insert(*id, *who));
@@ -162,8 +168,7 @@ impl frame_support::traits::Contains<NativeOrAssetId> for ReservedAssets {
 }
 
 impl Config for Test {
-    type RuntimeEvent = RuntimeEvent;
-    type ManageOrigin = EnsureRoot<u128>;
+    type ManageOrigin = EnsureRoot<AccountId>;
     type Balance = u128;
     type HigherPrecisionBalance = sp_core::U256;
     type AssetKind = NativeOrAssetId;
@@ -175,20 +180,26 @@ impl Config for Test {
     type DefaultProtocolFeeRecipient = ExcessRecipient;
     type CreatorFeeRecipient = MockCreators;
     type TreasurySink = MockSink;
-    type DefaultBidWindowBlocks = ConstU64<10>;
-    type DefaultSettlementWindowBlocks = ConstU64<5>;
-    type DefaultSolverBondAmount = ConstU128<1_000_000_000_000>;
+    type Base = crate::AssetConversionAdapter<Test, PoolAssetsFreezer>;
+    type RuntimeFreezeReason = RuntimeFreezeReason;
     type WeightInfo = ();
     #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = MockBenchHelper;
 }
 
+// The benchmarks' world; the unit tests run on the runtime-like one.
+#[allow(dead_code)]
 pub(crate) fn new_test_ext() -> sp_io::TestExternalities {
+    // Tests share a thread under `--test-threads=1`.
+    ExistentialDeposit::set(1);
+    AssetDeposit::set(0);
+    AssetAccountDeposit::set(0);
+
     let mut t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
 
     pallet_balances::GenesisConfig::<Test> {
-        // 10× the default solver bond (1e12) so tests can run register +
-        // deregister + re-register flows without hitting ED or balance limits.
+        dev_accounts: None,
+        // Enough for every flow here without hitting ED or balance limits.
         balances: vec![
             (ALICE, 10_000_000_000_000),
             (BOB, 10_000_000_000_000),
@@ -218,6 +229,61 @@ pub(crate) fn new_test_ext() -> sp_io::TestExternalities {
         System::set_block_number(1);
         SINK_VAULT.with(|v| *v.borrow_mut() = None);
         SINK_NOTED.with(|n| n.borrow_mut().clear());
+    });
+    ext
+}
+
+/// Externalities shaped like the runtime the DEX runs on: its ED and asset
+/// deposits, every asset non-sufficient except `SUFFICIENT_ID`, and the
+/// treasury holding exactly its ED (see [`crate::testing`]). The DEX's
+/// genesis build does not run, as on a chain that received the pallet by
+/// upgrade; that chain then runs this version's upgrade, so its migrations
+/// have run. `new_runtime_like_ext_before_upgrade` is the same chain before
+/// it, and `new_runtime_like_ext_from_genesis` one built with the pallet.
+pub(crate) fn new_runtime_like_ext() -> sp_io::TestExternalities {
+    build_runtime_like_ext(false, true)
+}
+
+pub(crate) fn new_runtime_like_ext_before_upgrade() -> sp_io::TestExternalities {
+    build_runtime_like_ext(false, false)
+}
+
+// For the tests that move to LP tokens next.
+#[allow(dead_code)]
+pub(crate) fn new_runtime_like_ext_from_genesis() -> sp_io::TestExternalities {
+    build_runtime_like_ext(true, false)
+}
+
+fn build_runtime_like_ext(dex_genesis: bool, upgraded: bool) -> sp_io::TestExternalities {
+    ExistentialDeposit::set(RUNTIME_ED);
+    AssetDeposit::set(RUNTIME_ASSET_DEPOSIT);
+    AssetAccountDeposit::set(RUNTIME_ASSET_ACCOUNT_DEPOSIT);
+
+    let mut t = runtime_like_storage::<Test>();
+    if dex_genesis {
+        pallet_vitreus_dex::GenesisConfig::<Test>::default()
+            .assimilate_storage(&mut t)
+            .unwrap();
+    }
+
+    let mut ext = sp_io::TestExternalities::new(t);
+    ext.execute_with(|| {
+        System::set_block_number(1);
+        SINK_VAULT.with(|v| *v.borrow_mut() = None);
+        SINK_NOTED.with(|n| n.borrow_mut().clear());
+        if upgraded {
+            // What the upgrade does for the fee escrow: its ED, from the
+            // treasury's stand-in.
+            use frame_support::traits::fungible::Mutate as _;
+            Balances::transfer(
+                &UpgradeSource::get(),
+                &VitreusDex::fee_escrow_account(),
+                RUNTIME_ED,
+                frame_support::traits::tokens::Preservation::Preserve,
+            )
+            .unwrap();
+            System::reset_events();
+        }
     });
     ext
 }
