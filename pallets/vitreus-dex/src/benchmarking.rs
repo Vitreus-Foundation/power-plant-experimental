@@ -12,7 +12,7 @@
 #![cfg(feature = "runtime-benchmarks")]
 
 use super::*;
-use crate::{settlement::IntentStatus, Pallet as Dex};
+use crate::Pallet as Dex;
 use frame_benchmarking::v2::*;
 use frame_support::traits::{fungibles::Create, EnsureOrigin, Get};
 use frame_system::RawOrigin;
@@ -76,8 +76,21 @@ fn setup_asset<T: Config>(seed: u32, holders: &[&T::AccountId]) -> T::AssetKind
 where
     T::Assets: Create<T::AccountId>,
 {
+    setup_asset_with::<T>(seed, holders, true)
+}
+
+/// [`setup_asset`], sufficient or not.
+fn setup_asset_with<T: Config>(
+    seed: u32,
+    holders: &[&T::AccountId],
+    sufficient: bool,
+) -> T::AssetKind
+where
+    T::Assets: Create<T::AccountId>,
+{
     let asset = T::BenchmarkHelper::asset_kind(seed);
-    T::Assets::create(asset.clone(), holders[0].clone(), true, One::one()).expect("create asset");
+    T::Assets::create(asset.clone(), holders[0].clone(), sufficient, One::one())
+        .expect("create asset");
     for h in holders {
         T::Assets::mint_into(asset.clone(), h, big::<T>()).expect("mint asset");
     }
@@ -89,8 +102,16 @@ fn setup_pool<T: Config>(provider: &T::AccountId) -> T::AssetKind
 where
     T::Assets: Create<T::AccountId>,
 {
+    setup_pool_with::<T>(provider, true)
+}
+
+/// [`setup_pool`] against a sufficient or a non-sufficient asset.
+fn setup_pool_with<T: Config>(provider: &T::AccountId, sufficient: bool) -> T::AssetKind
+where
+    T::Assets: Create<T::AccountId>,
+{
     fund_native::<T>(provider);
-    let asset = setup_asset::<T>(ASSET_A, &[provider]);
+    let asset = setup_asset_with::<T>(ASSET_A, &[provider], sufficient);
     Dex::<T>::do_create_pool(native::<T>(), asset.clone(), FEE_TIER).expect("create pool");
     Dex::<T>::do_add_liquidity_for(
         provider,
@@ -105,37 +126,16 @@ where
     asset
 }
 
+/// Use up `who`'s consumer references, so that a credit of a non-sufficient
+/// asset it does not hold has to open its account on a deposit.
+pub fn fill_consumers<T: frame_system::Config>(who: &T::AccountId) {
+    while frame_system::Pallet::<T>::can_accrue_consumers(who, 2) {
+        frame_system::Pallet::<T>::inc_consumers(who).expect("room for one more");
+    }
+}
+
 fn manage_origin<T: Config>() -> Result<T::RuntimeOrigin, BenchmarkError> {
     T::ManageOrigin::try_successful_origin().map_err(|_| BenchmarkError::Weightless)
-}
-
-fn register<T: Config>(who: &T::AccountId) -> u64 {
-    fund_native::<T>(who);
-    let id = NextSolverId::<T>::get();
-    Dex::<T>::register_solver(RawOrigin::Signed(who.clone()).into()).expect("register");
-    id
-}
-
-/// Intent from `user`: `trade()` of `asset` for native, `min_out` = 1,
-/// deadline far in the future. Returns the intent id.
-fn submit<T: Config>(user: &T::AccountId, asset: T::AssetKind) -> u64 {
-    let id = NextIntentId::<T>::get();
-    let deadline = frame_system::Pallet::<T>::block_number() + 1_000u32.into();
-    Dex::<T>::submit_intent(
-        RawOrigin::Signed(user.clone()).into(),
-        asset,
-        native::<T>(),
-        trade::<T>(),
-        One::one(),
-        deadline,
-    )
-    .expect("submit intent");
-    id
-}
-
-fn advance_blocks<T: Config>(n: BlockNumberFor<T>) {
-    let now = frame_system::Pallet::<T>::block_number();
-    frame_system::Pallet::<T>::set_block_number(now + n);
 }
 
 #[benchmarks(where T::Assets: Create<T::AccountId>)]
@@ -205,9 +205,12 @@ mod benchmarks {
     #[benchmark]
     fn swap_exact_tokens_for_tokens() {
         let provider: T::AccountId = account("provider", 0, 0);
-        let asset = setup_pool::<T>(&provider);
-        // D4: the dearer branch — a pool that routes both slices, so the swap
-        // also transfers to the fee escrow and bumps both counters.
+        // The dearer branch: a non-sufficient asset bought into an account
+        // whose consumer references are used up, so the swap first opens the
+        // caller's account for it on a deposit; and a pool that routes
+        // both slices, so the swap also transfers to the fee escrow and bumps
+        // both counters.
+        let asset = setup_pool_with::<T>(&provider, false);
         let pair = Dex::<T>::canonical_pair(native::<T>(), asset.clone());
         Pools::<T>::mutate(&pair, |p| {
             if let Some(p) = p {
@@ -216,20 +219,20 @@ mod benchmarks {
         });
         let caller: T::AccountId = whitelisted_caller();
         fund_native::<T>(&caller);
-        T::Assets::mint_into(asset.clone(), &caller, big::<T>()).expect("mint");
-        let before = T::Assets::balance(native::<T>(), &caller);
+        fill_consumers::<T>(&caller);
+        assert!(T::Assets::should_touch(asset.clone(), &caller));
 
         #[extrinsic_call]
         _(
             RawOrigin::Signed(caller.clone()),
-            asset,
             native::<T>(),
+            asset.clone(),
             trade::<T>(),
             One::one(),
             caller.clone(),
         );
 
-        assert!(T::Assets::balance(native::<T>(), &caller) > before);
+        assert!(!T::Assets::balance(asset, &caller).is_zero());
         assert!(!CreatorFeesUnclaimed::<T>::get(&pair).is_zero());
         assert!(!ProtocolFeesUnclaimed::<T>::get().is_zero());
     }
@@ -248,192 +251,6 @@ mod benchmarks {
             LiquidityPositions::<T>::get(&caller, &pair).expect("position").locked_until,
             Some(until)
         );
-    }
-
-    /// Dearer branch: the caller has a prior, inactive registration.
-    #[benchmark]
-    fn register_solver() {
-        let caller: T::AccountId = whitelisted_caller();
-        register::<T>(&caller);
-        Dex::<T>::deregister_solver(RawOrigin::Signed(caller.clone()).into()).expect("deregister");
-        let next = NextSolverId::<T>::get();
-
-        #[extrinsic_call]
-        _(RawOrigin::Signed(caller.clone()));
-
-        assert_eq!(SolverAccountToId::<T>::get(&caller), Some(next));
-        assert!(Solvers::<T>::get(next).expect("solver").active);
-    }
-
-    #[benchmark]
-    fn deregister_solver() {
-        let caller: T::AccountId = whitelisted_caller();
-        let id = register::<T>(&caller);
-
-        #[extrinsic_call]
-        _(RawOrigin::Signed(caller.clone()));
-
-        assert!(!Solvers::<T>::get(id).expect("solver").active);
-    }
-
-    #[benchmark]
-    fn submit_intent() {
-        let caller: T::AccountId = whitelisted_caller();
-        fund_native::<T>(&caller);
-        let asset = setup_asset::<T>(ASSET_A, &[&caller]);
-        let id = NextIntentId::<T>::get();
-        let deadline = frame_system::Pallet::<T>::block_number() + 1_000u32.into();
-
-        #[extrinsic_call]
-        _(
-            RawOrigin::Signed(caller.clone()),
-            asset,
-            native::<T>(),
-            trade::<T>(),
-            One::one(),
-            deadline,
-        );
-
-        assert_eq!(Intents::<T>::get(id).expect("intent").status, IntentStatus::Open);
-    }
-
-    #[benchmark]
-    fn cancel_intent() {
-        let caller: T::AccountId = whitelisted_caller();
-        fund_native::<T>(&caller);
-        let asset = setup_asset::<T>(ASSET_A, &[&caller]);
-        let id = submit::<T>(&caller, asset);
-
-        #[extrinsic_call]
-        _(RawOrigin::Signed(caller.clone()), id);
-
-        assert_eq!(Intents::<T>::get(id).expect("intent").status, IntentStatus::Cancelled);
-    }
-
-    /// Dearer branch: a prior commitment from another solver is displaced.
-    #[benchmark]
-    fn commit_fill() {
-        let user: T::AccountId = account("user", 0, 0);
-        fund_native::<T>(&user);
-        let asset = setup_asset::<T>(ASSET_A, &[&user]);
-        let id = submit::<T>(&user, asset);
-
-        let rival: T::AccountId = account("rival", 0, 0);
-        register::<T>(&rival);
-        Dex::<T>::commit_fill(RawOrigin::Signed(rival).into(), id, One::one())
-            .expect("rival commit");
-
-        let caller: T::AccountId = whitelisted_caller();
-        let solver_id = register::<T>(&caller);
-        let bid: T::Balance = 2u32.into();
-
-        #[extrinsic_call]
-        _(RawOrigin::Signed(caller.clone()), id, bid);
-
-        let c = FillCommitments::<T>::get(id).expect("commitment");
-        assert_eq!(c.solver_id, solver_id);
-        assert_eq!(c.committed_amount_out, bid);
-    }
-
-    /// Dearer branch: non-zero profit, so user, treasury and solver are all paid.
-    #[benchmark]
-    fn settle_intent() {
-        let provider: T::AccountId = account("provider", 0, 0);
-        let asset = setup_pool::<T>(&provider);
-
-        let user: T::AccountId = account("user", 0, 0);
-        fund_native::<T>(&user);
-        T::Assets::mint_into(asset.clone(), &user, big::<T>()).expect("mint");
-        let id = submit::<T>(&user, asset);
-
-        let caller: T::AccountId = whitelisted_caller();
-        let solver_id = register::<T>(&caller);
-        Dex::<T>::commit_fill(RawOrigin::Signed(caller.clone()).into(), id, One::one())
-            .expect("commit");
-        let before = T::Assets::balance(native::<T>(), &caller);
-
-        #[extrinsic_call]
-        _(RawOrigin::Signed(caller.clone()), id);
-
-        assert_eq!(Intents::<T>::get(id).expect("intent").status, IntentStatus::Settled);
-        assert!(T::Assets::balance(native::<T>(), &caller) > before);
-        assert_eq!(Solvers::<T>::get(solver_id).expect("solver").fills_completed, 1);
-    }
-
-    /// Dearer branch: bond split pays both treasury and slasher, and the user is refunded.
-    #[benchmark]
-    fn slash_solver() {
-        let user: T::AccountId = account("user", 0, 0);
-        fund_native::<T>(&user);
-        let asset = setup_asset::<T>(ASSET_A, &[&user]);
-        let id = submit::<T>(&user, asset);
-
-        let solver: T::AccountId = account("solver", 0, 0);
-        let solver_id = register::<T>(&solver);
-        Dex::<T>::commit_fill(RawOrigin::Signed(solver).into(), id, One::one()).expect("commit");
-        advance_blocks::<T>(Dex::<T>::current_settlement_window() + One::one());
-
-        let caller: T::AccountId = whitelisted_caller();
-        fund_native::<T>(&caller);
-        let before = T::Assets::balance(native::<T>(), &caller);
-
-        #[extrinsic_call]
-        _(RawOrigin::Signed(caller.clone()), id);
-
-        assert_eq!(Intents::<T>::get(id).expect("intent").status, IntentStatus::Expired);
-        assert!(!Solvers::<T>::get(solver_id).expect("solver").active);
-        assert!(T::Assets::balance(native::<T>(), &caller) > before);
-    }
-
-    #[benchmark]
-    fn refund_expired_intent() {
-        let caller: T::AccountId = whitelisted_caller();
-        fund_native::<T>(&caller);
-        let asset = setup_asset::<T>(ASSET_A, &[&caller]);
-        let id = submit::<T>(&caller, asset);
-        advance_blocks::<T>(1_000u32.into());
-
-        #[extrinsic_call]
-        _(RawOrigin::Signed(caller.clone()), id);
-
-        assert_eq!(Intents::<T>::get(id).expect("intent").status, IntentStatus::Expired);
-        assert!(IntentEscrowBalances::<T>::get(id).is_none());
-    }
-
-    #[benchmark]
-    fn set_bid_window() -> Result<(), BenchmarkError> {
-        let origin = manage_origin::<T>()?;
-        let v: BlockNumberFor<T> = 42u32.into();
-
-        #[extrinsic_call]
-        _(origin as T::RuntimeOrigin, v);
-
-        assert_eq!(BidWindowBlocks::<T>::get(), Some(v));
-        Ok(())
-    }
-
-    #[benchmark]
-    fn set_settlement_window() -> Result<(), BenchmarkError> {
-        let origin = manage_origin::<T>()?;
-        let v: BlockNumberFor<T> = 42u32.into();
-
-        #[extrinsic_call]
-        _(origin as T::RuntimeOrigin, v);
-
-        assert_eq!(SettlementWindowBlocks::<T>::get(), Some(v));
-        Ok(())
-    }
-
-    #[benchmark]
-    fn set_solver_bond_amount() -> Result<(), BenchmarkError> {
-        let origin = manage_origin::<T>()?;
-        let v = trade::<T>();
-
-        #[extrinsic_call]
-        _(origin as T::RuntimeOrigin, v);
-
-        assert_eq!(SolverBondAmount::<T>::get(), Some(v));
-        Ok(())
     }
 
     // ---- D4 ---------------------------------------------------------------

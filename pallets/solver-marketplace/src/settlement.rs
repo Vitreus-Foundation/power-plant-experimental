@@ -1,17 +1,14 @@
 //! Solver Marketplace Settlement — types and pure helpers.
 //!
-//! This module defines the data model and math helpers used by the solver
-//! marketplace extrinsics. Extrinsics, storage items, events, and errors are
-//! integrated into the main pallet's `lib.rs` in a separate step, because
-//! they need access to `T::Assets`, `T::AssetKind`, `T::Balance`, and the
-//! pallet's internal swap helper.
+//! The data model and math helpers the pallet's extrinsics use, kept apart
+//! from them because they need nothing from `Config`.
 //!
 //! Economic parameters exposed here are fixed at compile time. Operational
-//! parameters (bid window, settlement window, bond amount) are exposed as
-//! runtime storage items in the main pallet and set via a governance
-//! extrinsic gated on `T::ManageOrigin`.
+//! parameters (bid window, settlement window, bond amount) are runtime
+//! storage items in the pallet, set via governance extrinsics gated on
+//! `T::ManageOrigin`.
 
-use parity_scale_codec::{Decode, Encode, MaxEncodedLen};
+use parity_scale_codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use scale_info::TypeInfo;
 use sp_runtime::RuntimeDebug;
 
@@ -38,7 +35,18 @@ pub const SOLVER_PROFIT_FEE_BPS: u32 = 2_000;
 // ============================================================================
 
 /// Lifecycle status of an intent.
-#[derive(Clone, Copy, Encode, Decode, MaxEncodedLen, TypeInfo, RuntimeDebug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    MaxEncodedLen,
+    TypeInfo,
+    RuntimeDebug,
+    PartialEq,
+    Eq,
+)]
 pub enum IntentStatus {
     /// Awaiting solver commitment.
     Open,
@@ -59,7 +67,17 @@ pub enum IntentStatus {
 /// A user-submitted trading intent. Generic over account, asset, balance, and
 /// block-number types so it can be instantiated against the concrete pallet
 /// types (`T::AccountId`, `T::AssetKind`, `T::Balance`, `BlockNumberFor<T>`).
-#[derive(Clone, Encode, Decode, MaxEncodedLen, TypeInfo, RuntimeDebug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    MaxEncodedLen,
+    TypeInfo,
+    RuntimeDebug,
+    PartialEq,
+    Eq,
+)]
 pub struct Intent<AccountId, AssetKind, Balance, BlockNumber> {
     /// Pallet-scoped monotonically increasing id.
     pub id: u64,
@@ -86,7 +104,17 @@ pub struct Intent<AccountId, AssetKind, Balance, BlockNumber> {
 // ============================================================================
 
 /// Information about a registered solver.
-#[derive(Clone, Encode, Decode, MaxEncodedLen, TypeInfo, RuntimeDebug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    MaxEncodedLen,
+    TypeInfo,
+    RuntimeDebug,
+    PartialEq,
+    Eq,
+)]
 pub struct SolverInfo<AccountId, Balance, BlockNumber> {
     /// Pallet-scoped monotonically increasing id.
     pub id: u64,
@@ -118,7 +146,17 @@ pub struct SolverInfo<AccountId, Balance, BlockNumber> {
 
 /// A solver's commitment to fill a specific intent. Exists only during the
 /// `Committed` status window.
-#[derive(Clone, Encode, Decode, MaxEncodedLen, TypeInfo, RuntimeDebug, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    MaxEncodedLen,
+    TypeInfo,
+    RuntimeDebug,
+    PartialEq,
+    Eq,
+)]
 pub struct FillCommitment<AccountId, Balance, BlockNumber> {
     /// Id of the intent being filled.
     pub intent_id: u64,

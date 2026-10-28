@@ -198,11 +198,13 @@ fn lifecycle_happy_path() {
         let l = launch(id);
         assert_eq!(l.asset_id, asset_of(id));
         assert_eq!(Assets::total_supply(asset_of(id)), 1_000_000_000 * UNIT);
-        // creation fee: ED kept free, metadata deposits reserved, the rest to treasury;
-        // the initial buy then adds its net + creator fee to the escrow
+        // creation fee: ED kept free, one more ED set aside for the pool account,
+        // metadata deposits reserved, the rest to treasury; the initial buy then
+        // adds its net + creator fee to the escrow
         let s0 = state(id);
-        assert_eq!(vtrs(&l.escrow), ED + s0.real_quote + s0.creator_fees_unclaimed);
-        assert_eq!(Balances::reserved_balance(&l.escrow), 100 + 2 * 4 + 2 * 4);
+        assert_eq!(vtrs(&l.escrow), 2 * ED + s0.real_quote + s0.creator_fees_unclaimed);
+        // + the deposit for the pool address's launch-token account
+        assert_eq!(Balances::reserved_balance(&l.escrow), 100 + 2 * 4 + 2 * 4 + 10);
         assert!(tok(id, ALICE) > 0);
 
         let buyers = [BOB, CHARLIE, DAVE];
@@ -239,9 +241,7 @@ fn lifecycle_happy_path() {
         let t = T_DEFAULT;
         assert!(
             quote_seeded <= t && t - quote_seeded <= t / 100_000_000,
-            "raise {} vs T {}",
-            quote_seeded,
-            t
+            "raise {quote_seeded} vs T {t}"
         );
 
         // Position: escrow, locked forever.
@@ -253,7 +253,7 @@ fn lifecycle_happy_path() {
         let s = state(id);
         assert_eq!(
             vtrs(TREASURY) - treasury_before,
-            s.protocol_fees_paid + (CREATION_FEE - ED - (100 + 2 * 4 + 2 * 4))
+            s.protocol_fees_paid + (CREATION_FEE - 2 * ED - (100 + 2 * 4 + 2 * 4 + 10))
         );
         assert!(has_event(|e| matches!(e, Event::Graduated { .. })));
     });
@@ -431,12 +431,16 @@ fn fm02_prefunded_pool_account_does_not_move_opening_price() {
         let pool = Pools::<Test>::get(pair(id)).unwrap();
         let raised = pool.reserve_a;
         assert_eq!(pool.reserve_b, RESERVED);
-        // Live balances equal the stored amounts: nothing extra in the pool.
-        assert_eq!(vtrs(&pa), raised);
+        // Live balances equal the stored amounts: nothing extra in the pool
+        // beyond the pool account's own ED, which is not a reserve.
+        assert_eq!(vtrs(&pa), raised + ED);
         assert_eq!(tok(id, &pa), RESERVED);
-        // Donations went to the DEX excess recipient.
-        assert_eq!(vtrs(EXCESS) - excess_before.0, 5 * UNIT);
-        assert_eq!(tok(id, EXCESS) - excess_before.1, donated_tokens);
+        // The native donation went to the DEX excess recipient, all but the
+        // first ED, which the pool account kept as its own; the token
+        // donation was burned.
+        assert_eq!(vtrs(EXCESS) - excess_before.0, 5 * UNIT - ED);
+        assert_eq!(tok(id, EXCESS) - excess_before.1, 0);
+        assert_eq!(Assets::total_supply(asset_of(id)), 1_000_000_000 * UNIT - donated_tokens);
         // First swap prices off the stored reserves (sync_reserves finds nothing extra).
         let amount_in = 10 * UNIT;
         let after_fee = amount_in - amount_in * 3 / 1_000;
@@ -782,9 +786,14 @@ fn fm06_no_creator_lp_and_position_is_permanent() {
 
 /// Make the next seed fail: drain the DEX excess recipient so a pre-seed token
 /// donation at the pool address cannot be delivered (ExcessRecipientCannotReceive).
+/// Make the seed fail: the pre-seed sweep of a native donation that leaves
+/// less than an ED to an excess recipient holding nothing. (A donation of
+/// the launch token is burned, so it cannot fail the seed.)
 fn arm_seed_failure(id: LaunchId, donor: impl Borrow<Acc>) {
     let donor = donor.borrow();
-    assert_ok!(Balances::transfer_allow_death(origin(donor), pool_account(id), UNIT));
+    // The pool account keeps the first ED as its own; the half ED above it
+    // is what the sweep cannot deliver.
+    assert_ok!(Balances::transfer_allow_death(origin(donor), pool_account(id), ED + ED / 2));
     assert_ok!(Assets::transfer(
         origin(donor),
         asset_of(id).into(),
@@ -859,7 +868,8 @@ fn fm08_crossing_buy_partial_fill_and_deferred_seed() {
         assert_eq!(state(id).phase, Phase::Graduated);
         let pool = Pools::<Test>::get(pair(id)).unwrap();
         assert_eq!((pool.reserve_a, pool.reserve_b), (raised, RESERVED));
-        assert_eq!(vtrs(pool_account(id)), raised);
+        // (above the pool account's own ED, which is not a reserve)
+        assert_eq!(vtrs(pool_account(id)), raised + ED);
         assert_eq!(tok(id, pool_account(id)), RESERVED);
     });
 }
@@ -1219,6 +1229,8 @@ fn fm11_every_complete_state_has_a_forward_path() {
             },
         );
         TotalLiquidity::<Test>::insert(pair(id), 0u128);
+        // The ED pool creation gives every pool account.
+        assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), pool_account(id), ED));
         // liquidity at roughly p_end so the rescue is within tolerance
         let (pn, pd) = p_end(id);
         let tokens = tok(id, BOB);
@@ -1234,8 +1246,9 @@ fn fm11_every_complete_state_has_a_forward_path() {
         let s = state(id);
         assert_eq!(s.phase, Phase::Graduated);
         assert!(s.lp_shares > 0);
-        // funds left escrow only to the pool or the treasury
-        assert_eq!(vtrs(&e), ED + s.creator_fees_unclaimed);
+        // funds left escrow only to the pool or the treasury; the ED set
+        // aside for a new pool account stays, since this pool had its own
+        assert_eq!(vtrs(&e), 2 * ED + s.creator_fees_unclaimed);
         assert_eq!(tok(id, &e), 0);
         let pool = Pools::<Test>::get(pair(id)).unwrap();
         let to_pool_q = pool.reserve_a - quote;
@@ -1471,7 +1484,9 @@ fn fm15_escrow_survives_full_sellback_and_claims() {
             assert_ok!(Launchpad::claim_creator_fees(origin(ALICE), id));
             assert!(frame_system::Pallet::<Test>::account_exists(&e));
             assert!(vtrs(&e) >= ED);
-            assert_eq!(Balances::reserved_balance(&e), 100 + 2 * 4 + 2 * 4); // metadata base + per-byte; Create::create reserves no AssetDeposit
+            // metadata base + per-byte, and the pool address's launch-token
+            // account; Create::create reserves no AssetDeposit
+            assert_eq!(Balances::reserved_balance(&e), 100 + 2 * 4 + 2 * 4 + 10);
             assert_eq!(tok(id, &e), 1_000_000_000 * UNIT);
             buy(DAVE, id, UNIT);
             assert!(tok(id, DAVE) > 0);
@@ -1555,7 +1570,7 @@ fn weights_crossing_buy_refunds_when_not_crossing() {
         // Pre-dispatch, `buy` is always charged the crossing path.
         let call: RuntimeCall =
             crate::Call::<Test>::buy { launch_id: id, quote_in: 1, min_tokens_out: 0 }.into();
-        assert_eq!(call.get_dispatch_info().weight, <() as W>::buy_crossing());
+        assert_eq!(call.get_dispatch_info().call_weight, <() as W>::buy_crossing());
         assert!(<() as W>::buy_crossing().all_gt(<() as W>::buy()));
 
         // A buy that leaves tokens on the curve refunds down to `buy()`.
@@ -1580,7 +1595,7 @@ fn weights_crossing_buy_refunds_when_not_crossing() {
         }
         .into();
         assert_eq!(
-            call.get_dispatch_info().weight,
+            call.get_dispatch_info().call_weight,
             <() as W>::create_launch(4, 4, 0, 0).saturating_add(<() as W>::buy_crossing())
         );
         let post = Launchpad::create_launch(
@@ -1610,7 +1625,7 @@ fn weights_crossing_buy_refunds_when_not_crossing() {
             metadata: None,
         }
         .into();
-        assert_eq!(call.get_dispatch_info().weight, <() as W>::create_launch(4, 4, 0, 0));
+        assert_eq!(call.get_dispatch_info().call_weight, <() as W>::create_launch(4, 4, 0, 0));
         let post = Launchpad::create_launch(
             origin(CHARLIE),
             bv(b"Meme"),

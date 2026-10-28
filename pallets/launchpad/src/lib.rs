@@ -26,6 +26,8 @@ pub mod weights;
 pub use weights::WeightInfo;
 
 #[cfg(test)]
+mod account_lifecycle_tests;
+#[cfg(test)]
 mod mock;
 #[cfg(test)]
 mod tests;
@@ -42,7 +44,7 @@ use frame_support::{
             Fortitude::Polite,
             Preservation::{Expendable, Preserve},
         },
-        EnsureOrigin, Get,
+        AccountTouch, EnsureOrigin, Get,
     },
     BoundedVec, CloneNoBound, EqNoBound, PalletId, PartialEqNoBound, RuntimeDebugNoBound,
 };
@@ -50,7 +52,7 @@ use frame_system::pallet_prelude::BlockNumberFor;
 use pallet_vitreus_dex::{
     PoolManager, ReservedPoolSeeder, TreasurySink, MINIMUM_LIQUIDITY, MIN_LAUNCH_FEE_TIER,
 };
-use parity_scale_codec::{Decode, Encode, MaxEncodedLen};
+use parity_scale_codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use scale_info::TypeInfo;
 use sp_core::U256;
 use sp_runtime::{
@@ -85,7 +87,17 @@ pub const MAX_ASSET_ID_SCAN: u32 = 256;
 
 /// Governance parameters (§1.1). Live; snapshotted into each launch except
 /// `creation_fee`, which is charged once at creation.
-#[derive(Clone, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[derive(
+    Clone,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    Eq,
+    PartialEq,
+    RuntimeDebug,
+    TypeInfo,
+    MaxEncodedLen,
+)]
 pub struct LaunchParams<Balance> {
     /// Graduation target `T` in quote base units.
     pub graduation_target: Balance,
@@ -104,7 +116,17 @@ pub struct LaunchParams<Balance> {
 }
 
 /// Everything that determines pricing and fee routing for one launch (§1.2).
-#[derive(Clone, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[derive(
+    Clone,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    Eq,
+    PartialEq,
+    RuntimeDebug,
+    TypeInfo,
+    MaxEncodedLen,
+)]
 pub struct CurveParams<Balance> {
     pub graduation_target: Balance,
     /// `V_q = T / 3`.
@@ -116,7 +138,18 @@ pub struct CurveParams<Balance> {
     pub pool_fee_tier: u32,
 }
 
-#[derive(Clone, Copy, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[derive(
+    Clone,
+    Copy,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    Eq,
+    PartialEq,
+    RuntimeDebug,
+    TypeInfo,
+    MaxEncodedLen,
+)]
 pub enum Phase {
     Trading,
     Complete,
@@ -125,7 +158,17 @@ pub enum Phase {
 
 /// Cold, write-once launch record (§1.2). `creator_fee_recipient` is the only
 /// mutable field.
-#[derive(Clone, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[derive(
+    Clone,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    Eq,
+    PartialEq,
+    RuntimeDebug,
+    TypeInfo,
+    MaxEncodedLen,
+)]
 #[scale_info(skip_type_params(T))]
 pub struct Launch<T: Config> {
     pub asset_id: AssetIdOf<T>,
@@ -146,6 +189,7 @@ pub struct Launch<T: Config> {
     CloneNoBound,
     Encode,
     Decode,
+    DecodeWithMemTracking,
     EqNoBound,
     PartialEqNoBound,
     RuntimeDebugNoBound,
@@ -181,7 +225,17 @@ pub type LaunchMetadataOf<T> =
     LaunchMetadata<<T as Config>::UriLimit, <T as Config>::DescriptionLimit>;
 
 /// Hot per-launch curve state (§1.3).
-#[derive(Clone, Encode, Decode, Eq, PartialEq, RuntimeDebug, TypeInfo, MaxEncodedLen)]
+#[derive(
+    Clone,
+    Encode,
+    Decode,
+    DecodeWithMemTracking,
+    Eq,
+    PartialEq,
+    RuntimeDebug,
+    TypeInfo,
+    MaxEncodedLen,
+)]
 #[scale_info(skip_type_params(T))]
 pub struct CurveState<T: Config> {
     pub phase: Phase,
@@ -280,8 +334,6 @@ pub mod pallet {
     pub trait Config:
         frame_system::Config + pallet_vitreus_dex::Config<Balance: From<u128> + Into<u128>>
     {
-        type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
-
         /// Governance origin for `set_params`, `set_creation_paused`, rescue.
         /// Named `LaunchManageOrigin` because the DEX Config has its own `ManageOrigin`.
         type LaunchManageOrigin: EnsureOrigin<Self::RuntimeOrigin>;
@@ -569,7 +621,7 @@ pub mod pallet {
 
             let asset_kind = T::IntoAssetKind::convert(asset_id);
             ensure!(
-                !T::Dex::pool_exists(T::NativeAssetKind::get(), asset_kind),
+                !T::Dex::pool_exists(T::NativeAssetKind::get(), asset_kind.clone()),
                 Error::<T>::PoolAlreadySeeded
             );
             Self::ensure_seedable(curve.graduation_target.into(), Self::reserved().into())?;
@@ -577,7 +629,8 @@ pub mod pallet {
             let escrow = Self::escrow_account(id);
             let treasury = T::Treasury::get();
 
-            // 1. creation fee into escrow (funds ED + asset deposits)
+            // 1. creation fee into escrow (funds ED + asset deposits, and the
+            //    deposit for the pool address's launch-token account)
             T::Currency::transfer(&creator, &escrow, params.creation_fee, Preserve)?;
             // 2–4. asset, metadata (deposits reserved from escrow), full mint
             T::LaunchAssets::create(asset_id, escrow.clone(), false, One::one())?;
@@ -589,8 +642,29 @@ pub mod pallet {
                 TOKEN_DECIMALS,
             )?;
             T::LaunchAssets::mint_into(asset_id, &escrow, T::TotalSupply::get())?;
-            // 5. whatever the escrow can spare above ED (and above reserved deposits) goes to treasury
-            let spare = T::Currency::reducible_balance(&escrow, Preserve, Polite);
+            // 4a. the launch token's account at its future pool address, on a
+            // deposit from the escrow (out of the creation fee). The seed must
+            // credit the token there, and a credit the usual way needs a free
+            // consumer reference, which anyone can use up at a public address
+            // long before the curve sells out. A deposit-backed account needs
+            // none and stays open at zero balance. Opened whatever the address
+            // looks like now: a donor could give it a provider first, so that
+            // nothing seems to need opening, and fill its slots after.
+            let pool_account = pallet_vitreus_dex::Pallet::<T>::pool_account_for(
+                T::NativeAssetKind::get(),
+                asset_kind.clone(),
+            );
+            <<T as pallet_vitreus_dex::Config>::Assets as AccountTouch<_, _>>::touch(
+                asset_kind.clone(),
+                &pool_account,
+                &escrow,
+            )?;
+            // 5. whatever the escrow can spare above ED (and above reserved deposits) goes to
+            //    treasury, less one more ED set aside for the pool account, which its first
+            //    deposit — the seed — endows (`MinCreationFee` covers both).
+            let pool_ed = <T::Currency as FungibleInspect<T::AccountId>>::minimum_balance();
+            let spare =
+                T::Currency::reducible_balance(&escrow, Preserve, Polite).saturating_sub(pool_ed);
             if !spare.is_zero() {
                 T::Currency::transfer(&escrow, &treasury, spare, Preserve)?;
             }
@@ -647,6 +721,13 @@ pub mod pallet {
             // 8. optional atomic first buy. Charged as a crossing buy up front;
             // refunded to a plain buy when the curve was not exhausted.
             if !initial_buy.is_zero() {
+                // A creator whose consumer references are used up gets the
+                // token on a deposit of their own.
+                pallet_vitreus_dex::Pallet::<T>::open_for_credit(
+                    asset_kind.clone(),
+                    &creator,
+                    &creator,
+                )?;
                 // Not §2.10-free: creation pays its own fee, first buy included.
                 let (crossed, _, _) =
                     Self::do_buy(&creator, id, initial_buy, min_tokens_out, true, true)?;
@@ -680,6 +761,15 @@ pub mod pallet {
         ) -> DispatchResultWithPostInfo {
             let who = ensure_signed(origin)?;
             let launch = Launches::<T>::get(launch_id).ok_or(Error::<T>::LaunchNotFound)?;
+            // A buyer whose consumer references are used up gets the token on
+            // a deposit of their own. Here and not in `do_buy`, which also
+            // serves the treasury's `buy_for`: an account the pallet owns
+            // never pays a deposit.
+            pallet_vitreus_dex::Pallet::<T>::open_for_credit(
+                T::IntoAssetKind::convert(launch.asset_id),
+                &who,
+                &who,
+            )?;
             let (crossed, _, quote_used) = Self::do_buy(
                 &who,
                 launch_id,
@@ -1072,11 +1162,19 @@ pub mod pallet {
             // (`account_for == None`) already does. So, as on the DEX side, a
             // treasury total (`treasury_fees_paid`) does NOT count a sub-ED slice
             // taken before the vault existed; the window closes at the vault's
-            // first ≥ED credit (LAUNCH_TREASURY_SPEC §9.6).
-            let ed = <T::Currency as FungibleInspect<T::AccountId>>::minimum_balance();
+            // first ≥ED credit. Balances decides
+            // (`can_deposit`), not whether the vault's account exists: one kept
+            // alive by a sufficient asset holds no native and still cannot
+            // take less than an ED.
             let treasury_bal: BalanceOf<T> = treasury.into();
             let sink = match sink {
-                Some(v) if treasury_bal >= ed || frame_system::Pallet::<T>::account_exists(&v) => {
+                Some(v)
+                    if <T::Currency as FungibleInspect<T::AccountId>>::can_deposit(
+                        &v,
+                        treasury_bal,
+                        frame_support::traits::tokens::Provenance::Extant,
+                    ) == frame_support::traits::tokens::DepositConsequence::Success =>
+                {
                     Some(v)
                 },
                 _ => None,
