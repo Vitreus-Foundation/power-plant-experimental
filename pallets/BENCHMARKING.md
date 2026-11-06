@@ -254,3 +254,41 @@ weights to reach a live chain (weights are compiled into the runtime), and
 `benchmark overhead` (block and extrinsic base weights, in the consumer's
 `runtime/vitreus/src/weights/`) is a separate exercise on the same hardware
 if those were never measured either.
+
+## The DEX's benchmarks on the base pallet
+
+Since the DEX moved onto pallet-asset-conversion its extrinsics run the base
+pallet's code inside them, so its weights include the base pallet's work and
+are measured from this pallet's benchmarks alone; the base pallet's own
+calls are not in the runtime and need no weights of their own. Each
+benchmark sets up its costliest path:
+
+| Benchmark | Path measured |
+|---|---|
+| `create_pool` | the record only (the base pool comes with the first deposit) |
+| `add_liquidity` | the first deposit: the base pool created with its LP token, the pool account's account of a non-sufficient asset opened on a deposit, the provider's LP account opened |
+| `remove_liquidity` | a remove that first lifts an expired lock (thaw, record dropped) |
+| `swap_exact_tokens_for_tokens` | native in, protocol and creator slices to the escrow, the output a non-sufficient asset bought into an account whose consumer references are used up (opened on a deposit) |
+| `lock_liquidity` | a new lock, freezing the whole position |
+
+Graduation (the launchpad's `graduate` and `buy_crossing`) measures the seed
+with a full pre-seed sweep, the base pool's creation, the first deposit and
+both freezes. The DEX's and the launchpad's weights are placeholders until
+this pass runs, which needs a runtime that wires these pallets on 2512.
+
+## Not reproduced: a 0.1 VTRS gap in a launchpad benchmark's seed check
+
+Once, while the launchpad's benchmarks were being ported to the base pool,
+`bench_graduate` and `bench_buy_crossing` failed `assert_swept`'s "pool holds
+the raised VTRS and nothing parked" with the pool at
+2999999996250000004688 and the expected figure at 3000000096250000004688:
+10^17 apart, which is neither the mock's ED (10^14) nor any amount the
+benchmark parks. A rerun printing the figures showed the pool holding
+exactly `raise_at_sellout`, and the benchmarks have passed since. The cause
+is unknown. One lead: the launchpad test fm11 once produced the same
+figure, raise + 10^17, while it still gave the pool account an ED before
+the first deposit; the rescue's deposit at the skewed ratio magnified that
+ED about 1,000 times. Nothing in the benchmark gives the pool account an
+ED, so the lead is unconfirmed. If a seed check, or the pool's native balance after a seed, is
+off by 10^17 in a benchmark run (here or on the benchmarking machine), it
+is this, and it needs its cause found before the weights are taken.
