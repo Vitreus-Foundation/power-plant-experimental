@@ -49,9 +49,7 @@ use frame_support::{
     BoundedVec, CloneNoBound, EqNoBound, PalletId, PartialEqNoBound, RuntimeDebugNoBound,
 };
 use frame_system::pallet_prelude::BlockNumberFor;
-use pallet_vitreus_dex::{
-    PoolManager, ReservedPoolSeeder, TreasurySink, MINIMUM_LIQUIDITY, MIN_LAUNCH_FEE_TIER,
-};
+use pallet_vitreus_dex::{PoolManager, ReservedPoolSeeder, TreasurySink, MIN_LAUNCH_FEE_TIER};
 use parity_scale_codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use scale_info::TypeInfo;
 use sp_core::U256;
@@ -624,7 +622,7 @@ pub mod pallet {
                 !T::Dex::pool_exists(T::NativeAssetKind::get(), asset_kind.clone()),
                 Error::<T>::PoolAlreadySeeded
             );
-            Self::ensure_seedable(curve.graduation_target.into(), Self::reserved().into())?;
+            Self::ensure_seedable(asset_kind.clone(), curve.graduation_target)?;
 
             let escrow = Self::escrow_account(id);
             let treasury = T::Treasury::get();
@@ -633,7 +631,12 @@ pub mod pallet {
             //    deposit for the pool address's launch-token account)
             T::Currency::transfer(&creator, &escrow, params.creation_fee, Preserve)?;
             // 2–4. asset, metadata (deposits reserved from escrow), full mint
-            T::LaunchAssets::create(asset_id, escrow.clone(), false, One::one())?;
+            T::LaunchAssets::create(
+                asset_id,
+                escrow.clone(),
+                false,
+                Self::launch_asset_min_balance(),
+            )?;
             <T::LaunchAssets as MetadataMutate<T::AccountId>>::set(
                 asset_id,
                 &escrow,
@@ -653,15 +656,16 @@ pub mod pallet {
             let pool_account = pallet_vitreus_dex::Pallet::<T>::pool_account_for(
                 T::NativeAssetKind::get(),
                 asset_kind.clone(),
-            );
+            )
+            .ok_or(pallet_vitreus_dex::Error::<T>::PoolNotFound)?;
             <<T as pallet_vitreus_dex::Config>::Assets as AccountTouch<_, _>>::touch(
                 asset_kind.clone(),
                 &pool_account,
                 &escrow,
             )?;
             // 5. whatever the escrow can spare above ED (and above reserved deposits) goes to
-            //    treasury, less one more ED set aside for the pool account, which its first
-            //    deposit — the seed — endows (`MinCreationFee` covers both).
+            //    treasury, less one more ED set aside, which graduation sends to the treasury
+            //    too (`MinCreationFee` covers both; see `do_seed`).
             let pool_ed = <T::Currency as FungibleInspect<T::AccountId>>::minimum_balance();
             let spare =
                 T::Currency::reducible_balance(&escrow, Preserve, Polite).saturating_sub(pool_ed);
@@ -1063,10 +1067,9 @@ pub mod pallet {
         }
 
         fn snapshot(p: &LaunchParams<BalanceOf<T>>) -> CurveParams<BalanceOf<T>> {
-            let t: u128 = p.graduation_target.into();
             CurveParams {
                 graduation_target: p.graduation_target,
-                virtual_quote: (t / 3).into(),
+                virtual_quote: Self::virtual_quote(p.graduation_target),
                 curve_fee_bps: p.curve_fee_bps,
                 protocol_share_bps: p.protocol_share_bps,
                 treasury_share_bps: p.treasury_share_bps,
@@ -1114,12 +1117,35 @@ pub mod pallet {
             Ok(())
         }
 
-        /// FM-11 preflight: the first deposit the DEX would mint from
-        /// `(target, reserved)` must exceed its permanently burned minimum.
-        pub fn ensure_seedable(target: u128, reserved: u128) -> DispatchResult {
-            let shares = (U256::from(target) * U256::from(reserved)).integer_sqrt();
-            ensure!(shares > U256::from(MINIMUM_LIQUIDITY), Error::<T>::Unseedable);
-            Ok(())
+        /// Whether a launch of `asset` at `target` would open its pool when
+        /// it graduates, asked of the DEX on what the seed deposits. The
+        /// quote: everything the curve holds at sell-out, at least
+        /// [`curve::raise_at_sellout`], since no trade lowers `k`. The token:
+        /// the reserved allocation, which is all the escrow holds of it then,
+        /// less the minimum balance the seed leaves a holder.
+        pub fn ensure_seedable(asset: AssetKindOf<T>, target: BalanceOf<T>) -> DispatchResult {
+            let terms = curve::Terms {
+                virtual_quote: Self::virtual_quote(target).into(),
+                token_floor: T::VirtualTokenFloor::get().into(),
+                fee_bps: 0,
+            };
+            let raise = curve::raise_at_sellout(&terms, T::Sellable::get().into())
+                .ok_or(Error::<T>::ArithmeticOverflow)?;
+            let tokens = Self::reserved().saturating_sub(Self::launch_asset_min_balance());
+            // The DEX's one refusal here is `InsufficientInitialLiquidity`.
+            T::Dex::ensure_seedable(asset, T::NativeAssetKind::get(), tokens, raise.into())
+                .map_err(|_| Error::<T>::Unseedable.into())
+        }
+
+        /// `V_q`, the virtual quote reserve of a launch at `target`.
+        fn virtual_quote(target: BalanceOf<T>) -> BalanceOf<T> {
+            let t: u128 = target.into();
+            (t / 3).into()
+        }
+
+        /// The minimum balance every launch token is created with.
+        fn launch_asset_min_balance() -> BalanceOf<T> {
+            One::one()
         }
 
         fn map_math(e: curve::MathError) -> DispatchError {
@@ -1414,7 +1440,7 @@ pub mod pallet {
             let state = Curves::<T>::get(launch_id).ok_or(Error::<T>::LaunchNotFound)?;
             ensure!(state.phase == Phase::Complete, Error::<T>::WrongPhase);
             let reserved = Self::reserved();
-            let shares = T::Dex::seed_reserved_pool_for(
+            let seeded = T::Dex::seed_reserved_pool_for(
                 &launch.escrow,
                 T::IntoAssetKind::convert(launch.asset_id),
                 T::NativeAssetKind::get(),
@@ -1422,6 +1448,19 @@ pub mod pallet {
                 state.real_quote,
                 launch.curve.pool_fee_tier,
             )?;
+            let shares = seeded.shares;
+            // Creation set an ED aside for the pool account to keep as its
+            // own. The base pool keeps nothing of its own (its whole balance
+            // is reserve, so that ED would move the opening price), so it
+            // goes to the treasury. Never the creator's unclaimed fees, and
+            // nothing where a launch set nothing aside.
+            let pool_ed = <T::Currency as FungibleInspect<T::AccountId>>::minimum_balance();
+            let spare = T::Currency::reducible_balance(&launch.escrow, Preserve, Polite)
+                .saturating_sub(state.creator_fees_unclaimed);
+            let set_aside = pool_ed.min(spare);
+            if !set_aside.is_zero() {
+                T::Currency::transfer(&launch.escrow, &T::Treasury::get(), set_aside, Preserve)?;
+            }
             let now = frame_system::Pallet::<T>::block_number();
             Curves::<T>::mutate(launch_id, |maybe| {
                 if let Some(c) = maybe {
@@ -1433,8 +1472,8 @@ pub mod pallet {
             });
             Self::deposit_event(Event::Graduated {
                 launch_id,
-                quote_seeded: state.real_quote,
-                tokens_seeded: reserved,
+                quote_seeded: seeded.quote_seeded,
+                tokens_seeded: seeded.asset_seeded,
                 shares,
             });
             Ok(())

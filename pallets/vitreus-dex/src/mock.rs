@@ -21,6 +21,9 @@ construct_runtime!(
         Balances: pallet_balances,
         Assets: pallet_assets,
         VitreusDex: pallet_vitreus_dex,
+        AssetConversion: pallet_asset_conversion,
+        PoolAssets: pallet_assets::<Instance2>,
+        PoolAssetsFreezer: pallet_assets_freezer::<Instance2>,
     }
 );
 
@@ -35,6 +38,8 @@ impl frame_system::Config for Test {
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Test {
     type Balance = u128;
+    // The DEX freezes LP tokens; balances shares the runtime's freeze reasons.
+    type MaxFreezes = frame_support::traits::VariantCountOf<RuntimeFreezeReason>;
     type ExistentialDeposit = ExistentialDeposit;
     type AccountStore = System;
 }
@@ -67,7 +72,9 @@ impl pallet_assets::Config for Test {
 
 pub type NativeOrAssetId = frame_support::traits::fungible::NativeOrWithId<u32>;
 
-type NativeAndAssets = frame_support::traits::fungible::UnionOf<
+crate::impl_base_pallet_for_mock!(Test, AccountId, u32, NativeAndAssets, NativeAsset);
+
+pub type NativeAndAssets = frame_support::traits::fungible::UnionOf<
     Balances,
     Assets,
     frame_support::traits::fungible::NativeFromLeft,
@@ -173,11 +180,15 @@ impl Config for Test {
     type DefaultProtocolFeeRecipient = ExcessRecipient;
     type CreatorFeeRecipient = MockCreators;
     type TreasurySink = MockSink;
+    type Base = crate::AssetConversionAdapter<Test, PoolAssetsFreezer>;
+    type RuntimeFreezeReason = RuntimeFreezeReason;
     type WeightInfo = ();
     #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = MockBenchHelper;
 }
 
+// The benchmarks' world; the unit tests run on the runtime-like one.
+#[allow(dead_code)]
 pub(crate) fn new_test_ext() -> sp_io::TestExternalities {
     // Tests share a thread under `--test-threads=1`.
     ExistentialDeposit::set(1);
@@ -237,6 +248,8 @@ pub(crate) fn new_runtime_like_ext_before_upgrade() -> sp_io::TestExternalities 
     build_runtime_like_ext(false, false)
 }
 
+// For the tests that move to LP tokens next.
+#[allow(dead_code)]
 pub(crate) fn new_runtime_like_ext_from_genesis() -> sp_io::TestExternalities {
     build_runtime_like_ext(true, false)
 }
@@ -263,7 +276,6 @@ fn build_runtime_like_ext(dex_genesis: bool, upgraded: bool) -> sp_io::TestExter
             use frame_support::traits::{BeforeAllRuntimeMigrations, OnRuntimeUpgrade};
             AllPalletsWithSystem::before_all_runtime_migrations();
             crate::migrations::EndowFeeEscrow::<Test, UpgradeSource>::on_runtime_upgrade();
-            crate::migrations::v6::MigrateToV6::<Test, UpgradeSource>::on_runtime_upgrade();
             System::reset_events();
         }
     });

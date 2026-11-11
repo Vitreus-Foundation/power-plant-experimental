@@ -15,8 +15,10 @@
 //!
 //! **What is judged.**
 //! - After every op, `do_try_state` (what each pallet-owned account must
-//!   hold) and native conservation: nothing in the DEX mints or burns
-//!   native, so a drop in total issuance is native destroyed as dust.
+//!   hold), that every LP token of a pool is held by an actor or is the
+//!   pool account's locked minimum, and native conservation: nothing in the
+//!   DEX mints or burns native, so a drop in total issuance is native
+//!   destroyed as dust.
 //! - Every op's result: `Ok`, or an error that is the op's own business
 //!   (`SlippageExceeded`, `InsufficientShares`…). Anything
 //!   else is a refusal by `balances` or `assets` that the pallet did not
@@ -210,7 +212,11 @@ fn pool_asset(i: u8) -> u32 {
     POOL_ASSETS[i as usize % POOL_ASSETS.len()]
 }
 fn pool_account(asset: u32) -> AccountId {
-    VitreusDex::pool_account_for(native(), kind(asset))
+    VitreusDex::pool_account_for(native(), kind(asset)).unwrap()
+}
+/// `who`'s LP tokens in the native pool of `asset`.
+fn lp_of(who: &AccountId, asset: u32) -> u128 {
+    <Test as Config>::Base::lp_balance(&native(), &kind(asset), who)
 }
 
 fn resolve(target: &Target) -> AccountId {
@@ -344,7 +350,10 @@ impl World {
     }
 
     fn check_invariants(&mut self, op: &'static str) {
-        let now = VitreusDex::do_try_state().err().map(|e| format!("{e:?}"));
+        let now = VitreusDex::do_try_state()
+            .err()
+            .map(|e| format!("{e:?}"))
+            .or_else(lp_tokens_unaccounted);
         if let Some(broke) = &now {
             if self.broken.as_ref() != Some(broke) {
                 self.note(Finding::Invariant { op, broke: broke.clone() });
@@ -388,8 +397,7 @@ impl World {
             Op::RemoveLiquidity { who, pool, permille } => {
                 let who = actor(who);
                 let asset = kind(pool_asset(pool));
-                let pair = VitreusDex::canonical_pair(native(), asset.clone());
-                let shares = LiquidityPositions::<Test>::get(who, &pair)?.shares;
+                let shares = Some(lp_of(&who, pool_asset(pool))).filter(|s| *s > 0)?;
                 let shares = (shares * permille as u128 / 1000).max(1);
                 (
                     "remove_liquidity",
@@ -518,34 +526,124 @@ impl World {
                 self,
             );
         }
-        // Every LP but the pool's last may leave in full; the last leaves
-        // all but what the pool must keep, which is not judged here.
-        let positions: Vec<_> = LiquidityPositions::<Test>::iter()
-            .filter(|(_, _, p)| p.locked_until.is_none())
-            .collect();
-        for (who, pair, p) in positions {
-            let others = LiquidityPositions::<Test>::iter()
-                .filter(|(w, q, l)| *q == pair && *w != who && l.shares > 0)
-                .count();
-            if others == 0 {
-                continue;
-            }
-            // An LP whose own account cannot take its payout (it sent its
-            // native away) is refused by name; that is its own business.
-            let exit = VitreusDex::remove_liquidity(
-                RuntimeOrigin::signed(who),
-                pair.0,
-                pair.1,
-                p.shares,
-                0,
-                0,
-            );
-            if exit != Err(Error::<Test>::RecipientCannotReceive.into()) {
-                stuck("an LP's exit", exit, self);
+        // What the pallet guarantees an LP's exit: in full, or all but the
+        // remainder the asset's minimum requires (the base pool keeps each
+        // reserve at least at its minimum, so while the others hold only
+        // dust an LP cannot take it all; it keeps the LP tokens for it and
+        // redeems them once they leave). A position worth less than one unit
+        // of an asset's payout cannot be redeemed (the base pallet refuses an
+        // exit paying nothing on a side). Judged for every LP but the pool's
+        // last, who leaves all but what the pool must keep. A position under a lock
+        // (the seed's, for good) stays.
+        for asset in POOL_ASSETS {
+            let pair = VitreusDex::canonical_pair(native(), kind(asset));
+            for who in ACTORS {
+                let shares = lp_of(&who, asset);
+                if shares == 0 || LiquidityLocks::<Test>::contains_key(&pair, who) {
+                    continue;
+                }
+                let others = ACTORS.iter().filter(|w| **w != who && lp_of(w, asset) > 0).count();
+                if others == 0 {
+                    continue;
+                }
+                // An LP whose own account cannot take its payout (it sent its
+                // native away) is refused by name; that is its own business.
+                let exit = VitreusDex::remove_liquidity(
+                    RuntimeOrigin::signed(who),
+                    native(),
+                    kind(asset),
+                    shares,
+                    0,
+                    0,
+                );
+                let refused_by_minimum = exit == Err(Error::<Test>::ReserveBelowMinimum.into())
+                    || exit == Err(Error::<Test>::ZeroAmount.into());
+                let exit = if refused_by_minimum {
+                    match exit_keeping_minimums(asset, shares) {
+                        // The minimum does not bind: no excuse.
+                        None => exit,
+                        // It leaves this LP nothing it can be paid.
+                        Some(None) => Ok(()),
+                        Some(Some(most)) => VitreusDex::remove_liquidity(
+                            RuntimeOrigin::signed(who),
+                            native(),
+                            kind(asset),
+                            most,
+                            0,
+                            0,
+                        ),
+                    }
+                } else {
+                    exit
+                };
+                if exit != Err(Error::<Test>::RecipientCannotReceive.into()) {
+                    stuck("an LP's exit", exit, self);
+                }
             }
         }
         self.check_invariants("drain");
     }
+}
+
+/// The exit the pallet owes an LP of `shares` in the native pool of `asset`
+/// when it keeps each reserve at least its asset's minimum: `None` when
+/// that minimum does not bind (the full exit is owed), `Some(None)` when it
+/// leaves the LP nothing it can be paid (a reserve already at its minimum,
+/// or an exit that fits paying nothing on a side), and `Some(Some(l))` for
+/// the most LP tokens it lets go. A full exit paying nothing on a side,
+/// with room above the minimum, is a position worth less than one unit of
+/// that asset's payout: it cannot be redeemed (`Some(None)`).
+fn exit_keeping_minimums(asset: u32, shares: u128) -> Option<Option<u128>> {
+    use frame_support::traits::fungibles::Inspect;
+    let (r_native, r_token) = <Test as Config>::Base::reserves(&native(), &kind(asset))?;
+    let issuance = <Test as Config>::Base::lp_issuance(&native(), &kind(asset));
+    let wide = sp_core::U256::from;
+    let pays = |l: u128, reserve: u128| -> u128 {
+        (wide(l) * wide(reserve) / wide(issuance)).try_into().unwrap_or(u128::MAX)
+    };
+    let room_native = r_native.saturating_sub(<Test as Config>::Assets::minimum_balance(native()));
+    let room_token = r_token.saturating_sub(<Test as Config>::Assets::minimum_balance(kind(asset)));
+    if room_native == 0 || room_token == 0 {
+        // A reserve at its minimum: nothing can leave that side.
+        return Some(None);
+    }
+    let (full_native, full_token) = (pays(shares, r_native), pays(shares, r_token));
+    if full_native <= room_native && full_token <= room_token {
+        // The minimum does not bind. A payout of nothing on a side is a
+        // position worth less than one unit of it, which cannot be redeemed.
+        return if full_native == 0 || full_token == 0 { Some(None) } else { None };
+    }
+    // The largest l with floor(l · reserve / issuance) ≤ room.
+    let most = |reserve: u128, room: u128| -> u128 {
+        ((wide(room + 1) * wide(issuance) - 1) / wide(reserve))
+            .try_into()
+            .unwrap_or(u128::MAX)
+    };
+    let l = shares.min(most(r_native, room_native)).min(most(r_token, room_token));
+    if pays(l, r_native) == 0 || pays(l, r_token) == 0 {
+        return Some(None);
+    }
+    Some(Some(l))
+}
+
+/// Every LP token of every pool is an actor's or the pool account's locked
+/// minimum: the LP instance is a pallet-assets instance with no calls, so
+/// nothing else can hold one. Positions summing to the pool's total was
+/// `do_try_state`'s; the DEX does not enumerate LP holders, so it is judged
+/// here.
+fn lp_tokens_unaccounted() -> Option<String> {
+    for asset in POOL_ASSETS {
+        let issuance = <Test as Config>::Base::lp_issuance(&native(), &kind(asset));
+        if issuance == 0 {
+            continue;
+        }
+        let held: u128 = ACTORS.iter().map(|w| lp_of(w, asset)).sum::<u128>()
+            + lp_of(&pool_account(asset), asset);
+        if held != issuance {
+            return Some(format!("pool of {asset}: {held} LP tokens held of {issuance}"));
+        }
+    }
+    None
 }
 
 /// `amount` capped to half of what `who` holds of `asset`; `None` if that
@@ -735,6 +833,33 @@ fn full_slots_buyer_short_of_the_deposit_is_refused_by_name() {
         ));
         assert_ok!(buy(1_000));
         assert_eq!(Balances::reserved_balance(BOB), deposit);
+    });
+}
+
+/// A full-slots buyer pays the deposit out of the same spare balance as the
+/// swap. `affordable` offers half of what is spare, so between one and two
+/// deposits spare, that half and the deposit together are more than the buyer
+/// has: `leaving_deposit` has to cut the amount to what the deposit leaves.
+#[test]
+fn leaving_deposit_caps_full_slots_buy_to_what_deposit_leaves() {
+    use frame_support::assert_ok;
+    new_runtime_like_ext().execute_with(|| {
+        setup(Mode::today(true));
+        let mut world = World { findings: BTreeMap::new(), at: 0, broken: None };
+        fill_consumer_slots(BOB);
+
+        let deposit = AssetAccountDeposit::get();
+        let spare = 15;
+        assert!(spare > deposit && spare / 2 + deposit > spare);
+        assert_ok!(Balances::force_set_balance(RuntimeOrigin::root(), BOB, RUNTIME_ED + spare));
+
+        let buy = Op::Swap { who: 66, pool: 10, native_in: true, amount: 1_000 };
+        let (_, result) = world.step(&buy).expect("BOB can spare something");
+        assert_ok!(result);
+
+        assert_eq!(Balances::free_balance(BOB), RUNTIME_ED);
+        assert_eq!(Balances::reserved_balance(BOB), deposit);
+        assert!(Assets::balance(FRESH_ID, BOB) > 0);
     });
 }
 

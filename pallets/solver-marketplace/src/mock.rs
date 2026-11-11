@@ -22,6 +22,9 @@ construct_runtime!(
         Balances: pallet_balances,
         Assets: pallet_assets,
         VitreusDex: pallet_vitreus_dex,
+        AssetConversion: pallet_asset_conversion,
+        PoolAssets: pallet_assets::<Instance2>,
+        PoolAssetsFreezer: pallet_assets_freezer::<Instance2>,
         Marketplace: pallet_solver_marketplace,
     }
 );
@@ -37,6 +40,8 @@ impl frame_system::Config for Test {
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Test {
     type Balance = u128;
+    // The DEX freezes LP tokens; balances shares the runtime's freeze reasons.
+    type MaxFreezes = frame_support::traits::VariantCountOf<RuntimeFreezeReason>;
     type ExistentialDeposit = ExistentialDeposit;
     type AccountStore = System;
 }
@@ -112,6 +117,8 @@ impl frame_support::traits::Contains<NativeOrAssetId> for ReservedAssets {
     }
 }
 
+pallet_vitreus_dex::impl_base_pallet_for_mock!(Test, AccountId, u32, NativeAndAssets, NativeAsset);
+
 impl pallet_vitreus_dex::Config for Test {
     type ManageOrigin = EnsureRoot<AccountId>;
     type Balance = u128;
@@ -127,6 +134,8 @@ impl pallet_vitreus_dex::Config for Test {
     // No launch has a treasury here: every treasury slice folds into the
     // protocol share.
     type TreasurySink = ();
+    type Base = pallet_vitreus_dex::AssetConversionAdapter<Self, PoolAssetsFreezer>;
+    type RuntimeFreezeReason = RuntimeFreezeReason;
     type WeightInfo = ();
     #[cfg(feature = "runtime-benchmarks")]
     type BenchmarkHelper = ();
