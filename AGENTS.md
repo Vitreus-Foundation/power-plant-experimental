@@ -4,7 +4,7 @@ Guidance for coding agents in this repository. If a request conflicts with a rul
 
 Vitreus power-plant-experimental: pallets that power-plant takes as git dependencies, all at one rev. VTRS is the native token; transaction fees are paid in the energy token VNRG.
 
-The rules below are the ones from power-plant's AGENTS.md (`Vitreus-Foundation/power-plant`) that apply here, word for word. Where they mention the runtime, its release PRs or `construct_runtime!`, they mean power-plant's.
+The rules below are the ones from power-plant's AGENTS.md (`Vitreus-Foundation/power-plant`) that apply here, word for word, minus two parts that fit only power-plant. The rule on the public repository leaves out SECURITY.md, which doesn't cover this repository. The rule on PR series doesn't ask a PR to leave `main` ready to release, because power-plant pins only commits where a series is complete. Where they mention the runtime, its release PRs or `construct_runtime!`, they mean power-plant's.
 
 ## Commands
 
@@ -44,7 +44,7 @@ The CI workflow in `.github/workflows/` is the source of truth. Always pass `--l
 ## Pull requests
 
 - A PR covers one topic: a fix or a set of related fixes in one place, one feature, or one refactor, together with what it forces to change, such as callers, runtime wiring, runtime APIs and the docs it makes wrong, doc comments included.
-- Everything else goes to its own PR: unrelated fixes, refactors, renames, reformatting, dependency bumps and cleanups. Report what you noticed instead of fixing it, so it can become an issue; mention it in the PR description only if reviewers need it to understand this PR. Changes to several pallets and the runtime for different reasons are several PRs. Split a large topic into a series of PRs, each of which builds, passes tests and leaves `main` ready to release: no PR relies on a later one to close a gap or undo a regression it introduces. Plan the series before writing the code. If the code already exists as one change, rebuild the series topic by topic on top of `main` instead of slicing the diff: a slice follows files and commits, not topics.
+- Everything else goes to its own PR: unrelated fixes, refactors, renames, reformatting, dependency bumps and cleanups. Report what you noticed instead of fixing it, so it can become an issue; mention it in the PR description only if reviewers need it to understand this PR. Changes to several pallets and the runtime for different reasons are several PRs. Split a large topic into a series of PRs, each of which builds and passes tests. Plan the series before writing the code. If the code already exists as one change, rebuild the series topic by topic on top of `main` instead of slicing the diff: a slice follows files and commits, not topics.
 - When new code needs logic that already exists, even inside another function or another test module, reuse it: extract or move it to a place both can reach in the same PR instead of copying it. That move is part of what the PR forces to change, not a separate refactor.
 - Renames and other behavior-neutral cleanups in one pallet can share a PR of their own, one commit each, but never a PR with a fix or a feature.
 - A new name or doc term reuses the word its pallet and the code connected to that pallet already use for the same thing. A word that an unrelated pallet uses for something else is no reason to pick a different one.
