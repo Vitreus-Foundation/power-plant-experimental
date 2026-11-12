@@ -48,7 +48,6 @@ The CI workflow in `.github/workflows/` is the source of truth. Always pass `--l
 - When new code needs logic that already exists, even inside another function or another test module, reuse it: extract or move it to a place both can reach in the same PR instead of copying it. That move is part of what the PR forces to change, not a separate refactor.
 - Renames and other behavior-neutral cleanups in one pallet can share a PR of their own, one commit each, but never a PR with a fix or a feature.
 - A new name or doc term reuses the word its pallet and the code connected to that pallet already use for the same thing. A word that an unrelated pallet uses for something else is no reason to pick a different one.
-- Runtime-wide changes and changes to the token economics need the reviewers' agreement before the work starts, so the PR isn't rejected for its approach. Propose them in an issue, or use a discussion where they were already agreed, and link it from the PR. An option that stays off until governance turns it on needs agreement only on how it works: the vote that turns it on decides the rest.
 - `Cargo.lock` changes only for the dependencies the PR changes.
 - Don't add entries for your own tools or local files (IDE, agents, notes) to `.gitignore`; use `.git/info/exclude`.
 - If the PR changes what users or integrators see (RPC, call arguments, EVM semantics, fees, XCM, events), describe the impact in the PR description.
