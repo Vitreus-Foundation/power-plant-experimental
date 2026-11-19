@@ -45,7 +45,7 @@ The root `Cargo.toml` names the pallet at the same git source as every other
 SDK crate and patches it by name:
 
 ```toml
-pallet-asset-conversion = { git = "https://github.com/paritytech/polkadot-sdk", tag = "polkadot-stable2512-8", default-features = false }
+pallet-asset-conversion = { git = "https://github.com/paritytech/polkadot-sdk", branch = "stable2512", default-features = false }
 
 [patch."https://github.com/paritytech/polkadot-sdk"]
 pallet-asset-conversion = { path = "vendor/pallet-asset-conversion" }
@@ -109,8 +109,8 @@ builds against this crate, and the same check applies: does it use more than
 `src/swap.rs`, or configure the pallet?
 
 power-plant's SDK entries must also use this workspace's source string,
-`tag = "polkadot-stable2512-8"`. A `branch` or `rev` there would give it two
-copies of every SDK crate.
+`branch = "stable2512"`. A `tag` or `rev` there would give it two copies of
+every SDK crate.
 
 ## Updating
 

@@ -64,11 +64,11 @@ A consumer that takes the pallets also applies this workspace's `[patch]` for
 ## Dependency alignment
 
 `[workspace.dependencies]` names polkadot-sdk as `git = "https://github.com/paritytech/polkadot-sdk",
-tag = "polkadot-stable2512-8"` — the strings `power-plant`'s `Cargo.toml` must use too — and
+branch = "stable2512"` — the strings `power-plant`'s `Cargo.toml` must use too — and
 `Cargo.lock` resolves it to the same commit. Cargo unifies a git dependency between this workspace and
-a consumer only when the source strings match exactly; a `branch` or `rev` there against the `tag` here
-would give the consumer two `frame-support`s and a type error at every `Config` boundary. When
-`power-plant` moves its SDK, move this one to the same tag. `pallet-asset-conversion` is vendored from
+a consumer only when the source strings match exactly; a `tag` or `rev` there against the `branch` here,
+even at the same commit, would give the consumer two `frame-support`s and a type error at every `Config`
+boundary. When `power-plant` moves its SDK, move this one with it. `pallet-asset-conversion` is vendored from
 a later release and patched in by name (`vendor/pallet-asset-conversion/VENDORED.md`). The DEX core is
 built on it, so a consumer applies the same `[patch]`; without it, the consumer resolves the 2512
 release's `pallet-asset-conversion` instead of the vendored one.
